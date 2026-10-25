@@ -43,7 +43,7 @@ Planned: Reddit, Pinterest.
 ## Helper tools
 
 The footer shows `GET ...` buttons for the helpers that are missing; each
-downloads the official Windows build into `%APPDATA%\sippinkin`:
+downloads the official Windows build into `%APPDATA%\sippink\bin`:
 
 | Tool | Needed for | From |
 |---|---|---|
