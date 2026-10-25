@@ -223,8 +223,8 @@ pub fn convert(
     }
     let ffmpeg = ffmpeg.ok_or("this format needs ffmpeg (winget install Gyan.FFmpeg)")?;
     let args: &[&str] = match fmt {
-        Fmt::Mp3 => &["-vn", "-c:a", "libmp3lame", "-q:a", "2"],
-        Fmt::M4a => &["-vn", "-c:a", "aac", "-b:a", "192k"],
+        Fmt::Mp3 => &["-map", "0:a:0", "-c:a", "libmp3lame", "-q:a", "2"],
+        Fmt::M4a => &["-map", "0:a:0", "-c:a", "aac", "-b:a", "192k"],
         Fmt::Gif => &[
             "-vf",
             "fps=15,scale='min(480,iw)':-2:flags=lanczos,split[a][b];[a]palettegen[p];[b][p]paletteuse",
@@ -259,6 +259,9 @@ pub fn convert(
         Ok(())
     } else {
         let err = String::from_utf8_lossy(&out.stderr);
+        if err.contains("matches no streams") {
+            return Err("this video has no sound to save".into());
+        }
         let last = err.lines().last().unwrap_or("failed").trim();
         Err(format!("ffmpeg: {last}"))
     }
