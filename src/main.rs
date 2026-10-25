@@ -14,14 +14,17 @@ mod files;
 mod job;
 mod media;
 mod theme;
+mod tools;
 mod x;
+mod youtube;
 
 use files::human;
 use job::{Evt, Job};
 use media::{Fmt, Kind, Probe, Quality};
 use theme::{AMBER, DIM, FG, RED};
+use tools::{Tool, Tools};
 
-const COMPACT: [f32; 2] = [540.0, 420.0];
+const COMPACT: [f32; 2] = [560.0, 470.0];
 const FULL: [f32; 2] = [820.0, 600.0];
 
 fn dbg_log(msg: &str) {
@@ -94,7 +97,9 @@ struct App {
     quality: Quality,
     /// Skip the chooser and download with the remembered formats.
     auto: bool,
-    ffmpeg: Option<PathBuf>,
+    tools: Tools,
+    /// One-line status from tool installs / updates.
+    notice: String,
     downloads: Vec<DlRow>,
 }
 
@@ -183,9 +188,10 @@ impl App {
             next_token: 1,
             stage: Stage::Idle,
             fmt_for: HashMap::new(),
-            quality: Quality::Best,
+            quality: Quality::BEST,
             auto: false,
-            ffmpeg: media::find_ffmpeg(),
+            tools: Tools::detect(),
+            notice: String::new(),
             downloads: Vec::new(),
         }
     }
@@ -238,8 +244,9 @@ impl App {
         self.next_token += 1;
         self.stage = Stage::Probing { token, url: url.clone() };
         let report = self.reporter();
+        let tools = self.tools.clone();
         std::thread::spawn(move || {
-            let res = job::probe(&job::agent(), &url);
+            let res = job::probe(&job::agent(), &tools, &url);
             report(Evt::Probed { token, res });
         });
     }
@@ -264,15 +271,15 @@ impl App {
                 path: None,
                 started: Instant::now(),
             });
-            let fmt = media::usable_fmt(&m, self.fmt_for.get(&m.kind).copied(), self.ffmpeg.is_some());
+            let fmt = media::usable_fmt(&m, self.fmt_for.get(&m.kind).copied(), self.tools.ffmpeg.is_some());
             jobs.push(Job { id, media: m, fmt, quality: self.quality });
         }
         let report = self.reporter();
-        let (folder, ffmpeg) = (self.folder.clone(), self.ffmpeg.clone());
+        let (folder, tools) = (self.folder.clone(), self.tools.clone());
         std::thread::spawn(move || {
             let agent = job::agent();
             for j in jobs {
-                let evt = match job::run(&agent, ffmpeg.as_deref(), &folder, &j, &report) {
+                let evt = match job::run(&agent, &tools, &folder, &j, &report) {
                     Ok(path) => Evt::Done { id: j.id, path },
                     Err(msg) => Evt::Error { id: j.id, msg },
                 };
@@ -297,7 +304,7 @@ impl App {
                     }
                     self.stage = match res {
                         Ok(probe) => {
-                            let pick = vec![true; probe.items.len()];
+                            let pick = probe.items.iter().map(|m| m.default_on).collect();
                             Stage::Ready { probe, pick }
                         }
                         Err(e) => Stage::Failed(e),
@@ -325,9 +332,19 @@ impl App {
                 Evt::Done { id, path } => {
                     if let Some(r) = self.row(id) {
                         r.stat = Stat::Done;
+                        // after a conversion the file differs from what was fetched
+                        r.done = std::fs::metadata(&path).map_or(r.done, |m| m.len());
                         r.path = Some(path);
                     }
                 }
+                Evt::ToolReady { tool, res } => {
+                    self.notice = match res {
+                        Ok(_) => format!("{} ready", tool.name()),
+                        Err(e) => format!("{} install failed: {e}", tool.name()),
+                    };
+                    self.tools = Tools::detect();
+                }
+                Evt::Notice(text) => self.notice = text,
                 Evt::Error { id, msg } => {
                     if let Some(r) = self.row(id) {
                         r.stat = Stat::Error;
@@ -343,7 +360,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(">").color(AMBER));
                 let te = egui::TextEdit::singleline(&mut self.url)
-                    .hint_text("paste an X post or any direct file link")
+                    .hint_text("paste a YouTube / X link or any file link")
                     .desired_width(ui.available_width() - 70.0);
                 let r = ui.add(te);
                 if self.focus_input {
@@ -405,9 +422,10 @@ impl App {
                 let title = format!("FOUND: {}", summary.join(" + "));
                 let fmt_for = &mut self.fmt_for;
                 let quality = &mut self.quality;
-                let ffmpeg = self.ffmpeg.is_some();
+                let ffmpeg = self.tools.ffmpeg.is_some();
                 theme::pane(ui, &title, |ui| {
-                    ui.label(RichText::new(&probe.title).color(DIM));
+                    ui.add(egui::Label::new(RichText::new(&probe.title).color(DIM)).truncate(true))
+                        .on_hover_text(&probe.title);
                     egui::Grid::new("fmt").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                         for k in &kinds {
                             let sample = probe.items.iter().find(|m| m.kind == *k).unwrap();
@@ -421,7 +439,7 @@ impl App {
                                         egui::SelectableLabel::new(cur == *f, f.label()),
                                     );
                                     let r = r.on_disabled_hover_text(
-                                        "needs ffmpeg: winget install Gyan.FFmpeg, then restart",
+                                        "needs ffmpeg: press GET FFMPEG below",
                                     );
                                     if r.clicked() {
                                         fmt_for.insert(*k, *f);
@@ -434,10 +452,11 @@ impl App {
                         if let Some(m) = probe.items.iter().find(|m| m.variants.len() > 1) {
                             ui.label(RichText::new("QUALITY").color(AMBER));
                             ui.horizontal_wrapped(|ui| {
-                                for q in Quality::ALL {
-                                    let txt = format!("{} {}", q.label(), m.pick(q).label);
-                                    if ui.selectable_label(*quality == q, txt).clicked() {
-                                        *quality = q;
+                                let n = m.variants.len();
+                                for (i, v) in m.variants.iter().enumerate() {
+                                    let on = quality.index(n) == i;
+                                    if ui.selectable_label(on, &v.label).clicked() {
+                                        *quality = Quality::at(i, n);
                                     }
                                 }
                             });
@@ -543,11 +562,63 @@ impl App {
             if r.on_hover_text("skip the chooser and use the last formats").clicked() {
                 self.auto = !self.auto;
             }
-            let (txt, color) = match &self.ffmpeg {
-                Some(_) => ("ffmpeg: ok", DIM),
-                None => ("ffmpeg: missing (mp3/gif/webm off)", AMBER),
-            };
-            ui.label(RichText::new(txt).color(color));
+        });
+        ui.horizontal_wrapped(|ui| {
+            for t in Tool::ALL {
+                if self.tools.get(t).is_some() {
+                    ui.label(RichText::new(format!("{}:ok", t.name())).color(DIM));
+                } else if ui
+                    .button(RichText::new(format!("GET {}", t.name().to_uppercase())).color(AMBER))
+                    .on_hover_text(match t {
+                        Tool::YtDlp => "needed for YouTube",
+                        Tool::Ffmpeg => "needed for MP3 / GIF / WEBM and YouTube above 360p",
+                        Tool::Deno => "optional: helps yt-dlp get every YouTube format",
+                    })
+                    .clicked()
+                {
+                    self.install(t);
+                }
+            }
+            if let Some(exe) = self.tools.ytdlp.clone() {
+                let r = ui.small_button("UPDATE YT-DLP");
+                if r.on_hover_text("run this when YouTube downloads start failing").clicked() {
+                    self.notice = "updating yt-dlp...".into();
+                    let report = self.reporter();
+                    std::thread::spawn(move || {
+                        let msg = tools::update_ytdlp(&exe).unwrap_or_else(|e| format!("update failed: {e}"));
+                        report(Evt::Notice(msg));
+                    });
+                }
+            }
+        });
+        if !self.notice.is_empty() {
+            ui.label(RichText::new(&self.notice).color(AMBER));
+        }
+    }
+
+    /// Downloads a helper into Sippink's bin folder, shown as a queue row.
+    fn install(&mut self, tool: Tool) {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.downloads.push(DlRow {
+            id,
+            name: format!("installing {}", tool.name()),
+            done: 0,
+            total: 0,
+            stat: Stat::Running,
+            phase: String::new(),
+            err: String::new(),
+            path: None,
+            started: Instant::now(),
+        });
+        let report = self.reporter();
+        std::thread::spawn(move || {
+            let res = tools::install(&job::agent(), tool, id, &report);
+            report(match &res {
+                Ok(path) => Evt::Done { id, path: path.clone() },
+                Err(msg) => Evt::Error { id, msg: msg.clone() },
+            });
+            report(Evt::ToolReady { tool, res });
         });
     }
 }
@@ -629,9 +700,10 @@ impl eframe::App for App {
 fn cli(args: &[String]) -> i32 {
     let mut url = None;
     let mut fmt = None;
-    let mut quality = Quality::Best;
+    let mut quality_arg = String::from("BEST");
     let mut out = dirs::download_dir().unwrap_or_else(|| PathBuf::from("."));
     let mut only_probe = false;
+    let mut all = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -646,21 +718,38 @@ fn cli(args: &[String]) -> i32 {
                     return 2;
                 }
             }
-            "--quality" => {
-                let v = it.next().map(|s| s.to_ascii_uppercase()).unwrap_or_default();
-                quality = Quality::ALL.into_iter().find(|q| q.label() == v).unwrap_or(Quality::Best);
-            }
+            "--quality" => quality_arg = it.next().map(|s| s.to_ascii_uppercase()).unwrap_or_default(),
             "--out" => out = it.next().map(PathBuf::from).unwrap_or(out),
             "--probe" => only_probe = true,
+            "--all" => all = true,
+            "--install" => {
+                let name = it.next().map(String::as_str).unwrap_or("");
+                let Some(t) = Tool::ALL.into_iter().find(|t| t.name() == name) else {
+                    eprintln!("--install yt-dlp|ffmpeg|deno");
+                    return 2;
+                };
+                return match tools::install(&job::agent(), t, 0, &|_| {}) {
+                    Ok(p) => {
+                        println!("installed {}", p.display());
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        1
+                    }
+                };
+            }
             _ => {}
         }
     }
     let Some(url) = url else {
-        eprintln!("usage: sippink --get <url> [--fmt mp4|mp3|m4a|gif|webm|jpg|png|webp] [--quality best|medium|small] [--out dir] [--probe]");
+        eprintln!("usage: sippink --install yt-dlp|ffmpeg|deno");
+        eprintln!("       sippink --get <url> [--fmt mp4|mp3|m4a|gif|webm|jpg|png|webp] [--quality best|medium|small|1080p|...] [--out dir] [--probe] [--all]");
         return 2;
     };
     let agent = job::agent();
-    let probe = match job::probe(&agent, &url) {
+    let tools = Tools::detect();
+    let probe = match job::probe(&agent, &tools, &url) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: {e}");
@@ -676,18 +765,41 @@ fn cli(args: &[String]) -> i32 {
     if only_probe {
         return 0;
     }
-    let ffmpeg = media::find_ffmpeg();
+    // best / medium / small, or a size label of the first sized item (1080p, ORIG...)
+    let quality = match quality_arg.as_str() {
+        "BEST" => Quality::BEST,
+        "MEDIUM" => Quality(0.5),
+        "SMALL" => Quality(1.0),
+        label => {
+            let sized = probe.items.iter().find(|m| m.variants.len() > 1);
+            let found = sized.and_then(|m| {
+                let i = m.variants.iter().position(|v| v.label.eq_ignore_ascii_case(label))?;
+                Some(Quality::at(i, m.variants.len()))
+            });
+            match found {
+                Some(q) => q,
+                None => {
+                    eprintln!("no size {label} here");
+                    return 2;
+                }
+            }
+        }
+    };
     let _ = std::fs::create_dir_all(&out);
     let mut failed = 0;
-    for (i, m) in probe.items.into_iter().enumerate() {
-        let f = media::usable_fmt(&m, fmt, ffmpeg.is_some());
+    for (i, m) in probe.items.into_iter().enumerate().filter(|(_, m)| all || m.default_on) {
+        let f = media::usable_fmt(&m, fmt, tools.ffmpeg.is_some());
         let j = Job { id: i as u64 + 1, media: m, fmt: f, quality };
+        let last = std::cell::RefCell::new(String::new());
         let report = |e: Evt| {
             if let Evt::Phase { text, .. } = e {
-                println!("     {text}...");
+                if !text.is_empty() && *last.borrow() != text {
+                    println!("     {text}...");
+                    *last.borrow_mut() = text;
+                }
             }
         };
-        match job::run(&agent, ffmpeg.as_deref(), &out, &j, &report) {
+        match job::run(&agent, &tools, &out, &j, &report) {
             Ok(p) => {
                 let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
                 println!("  ok  {}  ({})", p.display(), human(size));
@@ -703,7 +815,7 @@ fn cli(args: &[String]) -> i32 {
 
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "--get") {
+    if args.iter().any(|a| a == "--get" || a == "--install") {
         std::process::exit(cli(&args));
     }
     let _ = std::fs::remove_file(std::env::temp_dir().join("sippink.log"));

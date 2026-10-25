@@ -22,9 +22,24 @@ pub fn apply(ctx: &egui::Context) {
         "monocraft".into(),
         FontData::from_static(include_bytes!("../assets/Monocraft.ttf")),
     );
-    // Monocraft first; egui's bundled fonts stay as fallback for glyphs it lacks.
+    // Monocraft first; egui's bundled fonts stay as fallback for glyphs it
+    // lacks, then Windows' own fonts for Thai and Japanese titles.
+    let system = [("thai", "tahoma.ttf"), ("cjk", "msgothic.ttc")];
+    let windir = std::env::var_os("WINDIR").unwrap_or_else(|| r"C:\Windows".into());
+    for (name, file) in system {
+        let path = std::path::Path::new(&windir).join("Fonts").join(file);
+        if let Ok(bytes) = std::fs::read(path) {
+            fonts.font_data.insert(name.into(), FontData::from_owned(bytes));
+        }
+    }
     for fam in [FontFamily::Monospace, FontFamily::Proportional] {
-        fonts.families.entry(fam).or_default().insert(0, "monocraft".into());
+        let list = fonts.families.entry(fam).or_default();
+        list.insert(0, "monocraft".into());
+        for (name, _) in system {
+            if fonts.font_data.contains_key(name) {
+                list.push(name.into());
+            }
+        }
     }
     ctx.set_fonts(fonts);
 

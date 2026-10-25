@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::files::{ext_for_mime, resolve_filename, sanitize, unique_path};
-use crate::media::{self, Fmt, Kind, Media, Probe, Quality, Variant};
-use crate::x;
+use crate::media::{self, Fetch, Fmt, Kind, Media, Probe, Quality, Variant};
+use crate::tools::Tools;
+use crate::{x, youtube};
 
 pub enum Evt {
     Probed { token: u64, res: Result<Probe, String> },
@@ -16,6 +17,8 @@ pub enum Evt {
     Phase { id: u64, text: String },
     Done { id: u64, path: PathBuf },
     Error { id: u64, msg: String },
+    ToolReady { tool: crate::tools::Tool, res: Result<PathBuf, String> },
+    Notice(String),
 }
 
 pub struct Job {
@@ -33,9 +36,12 @@ pub fn agent() -> ureq::Agent {
 }
 
 /// Works out what `url` holds without downloading the body.
-pub fn probe(agent: &ureq::Agent, url: &str) -> Result<Probe, String> {
+pub fn probe(agent: &ureq::Agent, tools: &Tools, url: &str) -> Result<Probe, String> {
     if let Some(id) = x::tweet_id(url) {
         return x::resolve(agent, &id);
+    }
+    if let Some(id) = youtube::video_id(url) {
+        return youtube::probe(tools, &id);
     }
     let resp = agent.get(url).call().map_err(|e| e.to_string())?;
     let name = resolve_filename(&resp, url);
@@ -58,59 +64,82 @@ pub fn probe(agent: &ureq::Agent, url: &str) -> Result<Probe, String> {
             kind,
             stem: sanitize(&stem),
             src_ext: ext,
-            variants: vec![Variant { url: url.to_string(), label: "ORIGINAL".into() }],
+            variants: vec![Variant { url: url.to_string(), label: "ORIGINAL".into(), height: None }],
+            fetch: Fetch::Http,
+            default_on: true,
         }],
     })
+}
+
+/// Temp files of one job start with this, so a failure can sweep them all
+/// (yt-dlp leaves per-stream pieces like `.f137.mp4.part`).
+pub fn temp_prefix(id: u64) -> String {
+    format!(".sippink-{}-{id}.", std::process::id())
 }
 
 /// Downloads one item into `folder` and converts it if needed.
 /// Returns the final file path.
 pub fn run(
     agent: &ureq::Agent,
-    ffmpeg: Option<&Path>,
+    tools: &Tools,
     folder: &Path,
     job: &Job,
     report: &dyn Fn(Evt),
 ) -> Result<PathBuf, String> {
     let m = &job.media;
+    let ffmpeg = tools.ffmpeg.as_deref();
     let fmt = if m.kind == Kind::File { Fmt::Original } else { job.fmt };
     if ffmpeg.is_none() && media::needs_ffmpeg(m, fmt) {
-        return Err(format!("{} needs ffmpeg (winget install Gyan.FFmpeg)", fmt.label()));
+        return Err(format!("{} needs ffmpeg: press GET FFMPEG", fmt.label()));
     }
     let out_ext = if fmt == Fmt::Original { m.src_ext.as_str() } else { fmt.ext() };
     let dest = unique_path(folder.join(format!("{}.{out_ext}", m.stem)));
     let shown = dest.file_name().map_or(String::new(), |s| s.to_string_lossy().into_owned());
     report(Evt::Named { id: job.id, name: shown });
 
-    let direct = fmt == Fmt::Original || out_ext == m.src_ext;
-    let part = if direct {
-        dest.with_extension(format!("{out_ext}.part"))
-    } else {
-        unique_path(folder.join(format!("{}.src.{}.part", m.stem, m.src_ext)))
-    };
+    let first = job.quality.index(m.variants.len());
     let res = (|| {
-        fetch(agent, &m.pick(job.quality).url, &part, job.id, report)?;
-        if direct {
-            std::fs::rename(&part, &dest).map_err(|e| e.to_string())
-        } else {
-            report(Evt::Phase { id: job.id, text: format!("converting to {}", fmt.label()) });
-            // ffmpeg / the image crate pick the codec from the extension, so
-            // give them a source path with its real extension.
-            let src = part.with_extension("");
-            std::fs::rename(&part, &src).map_err(|e| e.to_string())?;
-            let r = media::convert(ffmpeg, m, &src, fmt, &dest);
-            let _ = std::fs::remove_file(&src);
-            r
+        let src = match m.fetch {
+            Fetch::Http => {
+                let src = folder.join(format!("{}{}", temp_prefix(job.id), m.src_ext));
+                let part = src.with_extension(format!("{}.part", m.src_ext));
+                // Size lists can name sizes that don't exist (old YouTube
+                // videos have no maxres thumbnail): step down on 404.
+                let mut tries = m.variants[first..].iter().peekable();
+                while let Some(v) = tries.next() {
+                    match fetch(agent, &v.url, &part, job.id, report) {
+                        Err(e) if e.contains("status code 404") && tries.peek().is_some() => continue,
+                        r => r?,
+                    }
+                    break;
+                }
+                std::fs::rename(&part, &src).map_err(|e| e.to_string())?;
+                src
+            }
+            Fetch::YtDlp => youtube::download(tools, &m.variants[first], fmt, folder, job.id, report)?,
+        };
+        let src_ext = src.extension().map(|e| e.to_string_lossy().to_ascii_lowercase());
+        if fmt == Fmt::Original || src_ext.as_deref() == Some(out_ext) {
+            return std::fs::rename(&src, &dest).map_err(|e| e.to_string());
         }
+        report(Evt::Phase { id: job.id, text: format!("converting to {}", fmt.label()) });
+        let r = media::convert(ffmpeg, &src, fmt, &dest);
+        let _ = std::fs::remove_file(&src);
+        r
     })();
     if res.is_err() {
-        let _ = std::fs::remove_file(&part);
         let _ = std::fs::remove_file(&dest);
+        let prefix = temp_prefix(job.id);
+        for e in std::fs::read_dir(folder).into_iter().flatten().flatten() {
+            if e.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
     }
     res.map(|()| dest)
 }
 
-fn fetch(
+pub fn fetch(
     agent: &ureq::Agent,
     url: &str,
     to: &Path,

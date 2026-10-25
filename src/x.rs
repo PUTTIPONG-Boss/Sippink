@@ -7,7 +7,7 @@
 
 use serde_json::Value;
 
-use crate::media::{Kind, Media, Probe, Variant};
+use crate::media::{Fetch, Kind, Media, Probe, Variant};
 
 const HOSTS: [&str; 8] = [
     "x.com",
@@ -129,6 +129,8 @@ fn to_media(m: &Value) -> Option<Media> {
         stem: String::new(),
         src_ext: src_ext.into(),
         variants,
+        fetch: Fetch::Http,
+        default_on: true,
     };
     match m["type"].as_str()? {
         "photo" => {
@@ -140,6 +142,7 @@ fn to_media(m: &Value) -> Option<Media> {
                 .map(|size| Variant {
                     url: format!("{stem}?format={ext}&name={size}"),
                     label: size.to_ascii_uppercase(),
+                    height: None,
                 })
                 .collect();
             Some(media(Kind::Image, ext, variants))
@@ -156,7 +159,7 @@ fn to_media(m: &Value) -> Option<Media> {
                 .iter()
                 .filter_map(|v| {
                     let url = v["url"].as_str()?.to_string();
-                    Some(Variant { label: resolution(&url).unwrap_or("MP4").to_string(), url })
+                    Some(Variant { label: resolution(&url).unwrap_or("MP4").to_string(), url, height: None })
                 })
                 .collect();
             if variants.is_empty() {

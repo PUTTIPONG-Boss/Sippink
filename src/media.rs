@@ -1,8 +1,7 @@
 //! What a link turned out to be, which output formats make sense for it,
 //! and turning the downloaded source into the format the user picked.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Kind {
@@ -76,30 +75,48 @@ impl Fmt {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Quality {
-    Best,
-    Medium,
-    Small,
-}
+/// Where to sit in an item's size list: 0.0 = biggest, 1.0 = smallest.
+/// Relative, so one choice carries over to items with different lists
+/// (e.g. 720p of a video and LARGE of its thumbnail).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Quality(pub f32);
 
 impl Quality {
-    pub const ALL: [Quality; 3] = [Quality::Best, Quality::Medium, Quality::Small];
+    pub const BEST: Quality = Quality(0.0);
 
-    pub fn label(self) -> &'static str {
-        match self {
-            Quality::Best => "BEST",
-            Quality::Medium => "MEDIUM",
-            Quality::Small => "SMALL",
+    /// Entry `i` of a list of `n`.
+    pub fn at(i: usize, n: usize) -> Quality {
+        if n <= 1 {
+            Quality::BEST
+        } else {
+            Quality(i as f32 / (n - 1) as f32)
+        }
+    }
+
+    pub fn index(self, n: usize) -> usize {
+        if n <= 1 {
+            0
+        } else {
+            ((self.0 * (n - 1) as f32).round() as usize).min(n - 1)
         }
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct Variant {
+    /// The file itself, or the page for yt-dlp.
     pub url: String,
     /// e.g. "1280x720" or "ORIG"
     pub label: String,
+    /// Height cap handed to yt-dlp.
+    pub height: Option<u32>,
+}
+
+/// How the bytes get here.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Fetch {
+    Http,
+    YtDlp,
 }
 
 #[derive(Clone, Debug)]
@@ -111,18 +128,9 @@ pub struct Media {
     pub src_ext: String,
     /// Best first.
     pub variants: Vec<Variant>,
-}
-
-impl Media {
-    pub fn pick(&self, q: Quality) -> &Variant {
-        let n = self.variants.len();
-        let i = match q {
-            Quality::Best => 0,
-            Quality::Medium => n / 2,
-            Quality::Small => n - 1,
-        };
-        &self.variants[i]
-    }
+    pub fetch: Fetch,
+    /// Ticked in the chooser to begin with (extras like thumbnails aren't).
+    pub default_on: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -158,19 +166,19 @@ pub fn kind_for(content_type: &str, ext: &str) -> Kind {
     }
 }
 
-/// True when turning `m` into `fmt` takes more than renaming the file.
-fn is_passthrough(m: &Media, fmt: Fmt) -> bool {
-    fmt == Fmt::Original || fmt.ext() == m.src_ext
-}
-
 /// Conversions the built-in image decoder handles without ffmpeg.
-fn image_crate_can(m: &Media, fmt: Fmt) -> bool {
-    let still_src = matches!(m.src_ext.as_str(), "jpg" | "png" | "webp" | "gif" | "bmp");
+fn image_crate_can(src_ext: &str, fmt: Fmt) -> bool {
+    let still_src = matches!(src_ext, "jpg" | "png" | "webp" | "gif" | "bmp");
     still_src && matches!(fmt, Fmt::Jpg | Fmt::Png | Fmt::Webp)
 }
 
 pub fn needs_ffmpeg(m: &Media, fmt: Fmt) -> bool {
-    !is_passthrough(m, fmt) && !image_crate_can(m, fmt)
+    if m.fetch == Fetch::YtDlp {
+        // yt-dlp can hand over MP4 (single-file formats) and M4A audio as-is.
+        return !matches!(fmt, Fmt::Mp4 | Fmt::M4a);
+    }
+    let passthrough = fmt == Fmt::Original || fmt.ext() == m.src_ext;
+    !passthrough && !image_crate_can(&m.src_ext, fmt)
 }
 
 /// `wanted` if it can be made, else the first format for `m` that can.
@@ -183,36 +191,10 @@ pub fn usable_fmt(m: &Media, wanted: Option<Fmt>, have_ffmpeg: bool) -> Fmt {
         .unwrap_or(Fmt::Original)
 }
 
-/// `SIPPINK_FFMPEG`, else ffmpeg next to the exe, on PATH, or where
-/// `winget install Gyan.FFmpeg` links it.
-pub fn find_ffmpeg() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("SIPPINK_FFMPEG").map(PathBuf::from) {
-        return p.is_file().then_some(p);
-    }
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Some(d) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
-        dirs.push(d);
-    }
-    if let Some(path) = std::env::var_os("PATH") {
-        dirs.extend(std::env::split_paths(&path));
-    }
-    if let Some(l) = std::env::var_os("LOCALAPPDATA") {
-        dirs.push(PathBuf::from(l).join("Microsoft").join("WinGet").join("Links"));
-    }
-    dirs.into_iter()
-        .map(|d| d.join(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" }))
-        .find(|p| p.is_file())
-}
-
 /// Writes `src` (as downloaded) to `dest` in `fmt`. `src` is left in place.
-pub fn convert(
-    ffmpeg: Option<&Path>,
-    m: &Media,
-    src: &Path,
-    fmt: Fmt,
-    dest: &Path,
-) -> Result<(), String> {
-    if image_crate_can(m, fmt) {
+pub fn convert(ffmpeg: Option<&Path>, src: &Path, fmt: Fmt, dest: &Path) -> Result<(), String> {
+    let src_ext = src.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    if image_crate_can(&src_ext, fmt) {
         let img = image::open(src).map_err(|e| format!("decode: {e}"))?;
         let img = match fmt {
             // JPEG has no alpha channel.
@@ -221,7 +203,7 @@ pub fn convert(
         };
         return img.save(dest).map_err(|e| format!("encode: {e}"));
     }
-    let ffmpeg = ffmpeg.ok_or("this format needs ffmpeg (winget install Gyan.FFmpeg)")?;
+    let ffmpeg = ffmpeg.ok_or("this format needs ffmpeg: press GET FFMPEG")?;
     let args: &[&str] = match fmt {
         Fmt::Mp3 => &["-map", "0:a:0", "-c:a", "libmp3lame", "-q:a", "2"],
         Fmt::M4a => &["-map", "0:a:0", "-c:a", "aac", "-b:a", "192k"],
@@ -243,17 +225,11 @@ pub fn convert(
         Fmt::Jpg | Fmt::Png | Fmt::Webp => &["-frames:v", "1"],
         Fmt::Original => &[],
     };
-    let mut cmd = Command::new(ffmpeg);
+    let mut cmd = crate::tools::hidden(ffmpeg);
     cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
         .arg(src)
         .args(args)
         .arg(dest);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
     let out = cmd.output().map_err(|e| format!("ffmpeg: {e}"))?;
     if out.status.success() {
         Ok(())
@@ -272,7 +248,23 @@ mod tests {
     use super::*;
 
     fn media(kind: Kind, src_ext: &str) -> Media {
-        Media { kind, stem: "a".into(), src_ext: src_ext.into(), variants: vec![] }
+        Media {
+            kind,
+            stem: "a".into(),
+            src_ext: src_ext.into(),
+            variants: vec![],
+            fetch: Fetch::Http,
+            default_on: true,
+        }
+    }
+
+    #[test]
+    fn quality_carries_over_by_rank() {
+        let q = Quality::at(2, 8); // 1080p of 2160..144
+        assert_eq!(q.index(8), 2);
+        assert_eq!(Quality::BEST.index(5), 0);
+        assert_eq!(Quality::at(7, 8).index(3), 2);
+        assert_eq!(Quality::at(3, 8).index(1), 0);
     }
 
     #[test]
@@ -294,6 +286,11 @@ mod tests {
         assert!(needs_ffmpeg(&x_gif, Fmt::Png));
         let video = media(Kind::Video, "mp4");
         assert!(needs_ffmpeg(&video, Fmt::Mp3));
+        let yt = Media { fetch: Fetch::YtDlp, ..media(Kind::Video, "mp4") };
+        assert!(!needs_ffmpeg(&yt, Fmt::Mp4));
+        assert!(!needs_ffmpeg(&yt, Fmt::M4a));
+        assert!(needs_ffmpeg(&yt, Fmt::Mp3));
+        assert!(needs_ffmpeg(&yt, Fmt::Webm));
     }
 
     #[test]
@@ -304,7 +301,7 @@ mod tests {
         image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 128])).save(&src).unwrap();
         for fmt in [Fmt::Jpg, Fmt::Webp] {
             let dest = dir.join(format!("out.{}", fmt.ext()));
-            convert(None, &media(Kind::Image, "png"), &src, fmt, &dest).unwrap();
+            convert(None, &src, fmt, &dest).unwrap();
             assert!(image::open(&dest).is_ok());
         }
     }
