@@ -112,3 +112,41 @@ cargo test -- --ignored    # live tests against x.com
 
 Font: [Monocraft](https://github.com/IdreesInc/Monocraft) (SIL OFL 1.1,
 see `assets/Monocraft-OFL.txt`).
+
+## Branches and releases
+
+| Branch | What it is |
+|---|---|
+| `main` | Released versions only. Every commit here has a `vX.Y.Z` tag. |
+| `master` | Work in progress. Try things here; CI builds and tests every push. |
+| `feat/...`, `fix/...` | One change each, branched from `master`. |
+
+Work on something:
+
+```
+git switch master
+git pull
+git switch -c fix/tray-menu
+# ...commit...
+git switch master
+git merge fix/tray-menu
+git push                    # CI builds and tests it
+```
+
+Release it once `master` is good (example: 0.1.1):
+
+```
+# on master: set version = "0.1.1" in Cargo.toml
+cargo build                 # updates Cargo.lock
+git commit -am "Release v0.1.1"
+git push
+git switch main
+git merge --ff-only master
+git tag v0.1.1
+git push origin main v0.1.1
+git switch master
+```
+
+The tag push makes GitHub Actions build `sippink-v0.1.1-windows-x64.exe`
+and publish it on the Releases page. It refuses tags that aren't on `main`
+or don't match `Cargo.toml`.

@@ -718,7 +718,7 @@ impl eframe::App for App {
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("SIPPINK").heading().color(FG));
-                ui.label(RichText::new("v0.1 :: sip a link").color(DIM));
+                ui.label(RichText::new(concat!("v", env!("CARGO_PKG_VERSION"), " :: sip a link")).color(DIM));
             });
             self.input_bar(ui);
             self.chooser(ui);

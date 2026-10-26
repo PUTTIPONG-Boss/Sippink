@@ -1,0 +1,41 @@
+# Pushing a tag like v0.1.1 that sits on main builds sippink.exe and
+# publishes it as a GitHub Release.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Tag must be on main and match Cargo.toml
+        shell: bash
+        run: |
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main \
+            || { echo "::error::$GITHUB_REF_NAME is not on main"; exit 1; }
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "v$version" = "$GITHUB_REF_NAME" ] \
+            || { echo "::error::Cargo.toml says $version, tag is $GITHUB_REF_NAME"; exit 1; }
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+      - run: cargo build --release
+
+      - name: Name the exe after the version
+        shell: bash
+        run: cp target/release/sippink.exe "sippink-$GITHUB_REF_NAME-windows-x64.exe"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: sippink-${{ github.ref_name }}-windows-x64.exe
+          generate_release_notes: true
