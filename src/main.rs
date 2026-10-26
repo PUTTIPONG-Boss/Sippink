@@ -111,25 +111,17 @@ struct App {
     downloads: Vec<DlRow>,
 }
 
-fn make_icon() -> Icon {
-    let (w, h) = (32u32, 32u32);
-    let mut rgba = vec![0u8; (w * h * 4) as usize];
-    let bgc = [theme::BG.r(), theme::BG.g(), theme::BG.b()];
-    let fgc = [FG.r(), FG.g(), FG.b()];
-    for y in 0..h as i32 {
-        for x in 0..w as i32 {
-            let i = ((y as u32 * w + x as u32) * 4) as usize;
-            let cx = 16i32;
-            // 2px frame, then a down arrow: shaft + head
-            let frame = !(2..30).contains(&x) || !(2..30).contains(&y);
-            let shaft = (cx - 2..=cx + 1).contains(&x) && (6..=18).contains(&y);
-            let half = 25 - y + 1;
-            let head = (17..=25).contains(&y) && x >= cx - half && x <= cx + half - 1;
-            let c = if frame || shaft || head { fgc } else { bgc };
-            rgba[i..i + 3].copy_from_slice(&c);
-            rgba[i + 3] = 255;
-        }
-    }
+/// assets/icon.png (also baked into the exe by build.rs) at `size` px.
+fn icon_rgba(size: u32) -> (Vec<u8>, u32, u32) {
+    let img = image::load_from_memory(include_bytes!("../assets/icon.png")).expect("icon.png");
+    // Pixel art: nearest-neighbour keeps the edges sharp.
+    let img = img.resize_exact(size, size, image::imageops::FilterType::Nearest).to_rgba8();
+    let (w, h) = img.dimensions();
+    (img.into_raw(), w, h)
+}
+
+fn tray_icon() -> Icon {
+    let (rgba, w, h) = icon_rgba(32);
     Icon::from_rgba(rgba, w, h).expect("icon")
 }
 
@@ -149,7 +141,7 @@ impl App {
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip("Sippink — sip a link. Double-click to paste one")
-            .with_icon(make_icon())
+            .with_icon(tray_icon())
             .build()
             .expect("tray");
 
@@ -911,6 +903,10 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Sippink")
+            .with_icon({
+                let (rgba, width, height) = icon_rgba(64);
+                egui::IconData { rgba, width, height }
+            })
             .with_inner_size(COMPACT)
             .with_min_inner_size([420.0, 260.0])
             .with_resizable(true),
