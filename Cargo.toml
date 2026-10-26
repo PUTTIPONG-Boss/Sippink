@@ -2,6 +2,9 @@
 name = "sippink"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "Paste a link, sip the media: YouTube / X / Pinterest downloader"
+repository = "https://github.com/PUTTIPONG-Boss/Sippink"
 
 [dependencies]
 dirs = "5"

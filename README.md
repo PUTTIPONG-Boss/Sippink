@@ -1,7 +1,23 @@
-# Sippink
+<p align="center">
+  <img src="assets/icon.png" width="96" alt="Sippink icon">
+</p>
 
-*sip* + *link*: paste a link, get the media. A small tray app for Windows
-(Rust + egui) with a terminal look.
+<h1 align="center">Sippink</h1>
+
+<p align="center">
+  <i>sip</i> + <i>link</i>: paste a link, get the media.<br>
+  A small Windows tray app (Rust + egui) with a terminal look, for YouTube,
+  X / Twitter, Pinterest and plain file links.
+</p>
+
+<p align="center">
+  <a href="https://github.com/PUTTIPONG-Boss/Sippink/releases/latest">Download the latest sippink.exe</a>
+</p>
+
+<p align="center">
+  <img src="docs/youtube.png" width="420" alt="YouTube link: every resolution from 2160p to 144p, MP4 / MP3 / M4A / GIF / WEBM">
+  <img src="docs/pinterest-board.png" width="420" alt="A whole Pinterest board: 1 video, 1 GIF and 62 images, toggled by type">
+</p>
 
 ## What it does
 
@@ -16,6 +32,10 @@
 | VIDEO | MP4, MP3, M4A, GIF, WEBM |
 | GIF   | GIF, MP4, WEBM, PNG, JPG |
 | IMAGE | JPG, PNG, WEBP |
+
+<p align="center">
+  <img src="docs/queue.png" width="420" alt="Finished downloads in the queue, each with an OPEN button">
+</p>
 
 Quality: every size the source has (`2160p 1440p 1080p ...`,
 `3840x2160 ...`, `ORIG LARGE SMALL`). Other items in the same post follow by
@@ -110,8 +130,12 @@ cargo test                 # offline tests
 cargo test -- --ignored    # live tests against x.com
 ```
 
-Font: [Monocraft](https://github.com/IdreesInc/Monocraft) (SIL OFL 1.1,
-see `assets/Monocraft-OFL.txt`).
+## License
+
+[MIT](LICENSE). The bundled font, [Monocraft](https://github.com/IdreesInc/Monocraft),
+is under the SIL Open Font License 1.1 (`assets/Monocraft-OFL.txt`).
+yt-dlp, ffmpeg and deno are not bundled; the app downloads their official
+builds on request, and they keep their own licenses.
 
 ## Branches and releases
 
