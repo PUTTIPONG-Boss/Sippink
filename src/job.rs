@@ -3,6 +3,8 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::files::{ext_for_mime, resolve_filename, sanitize, unique_path};
@@ -12,6 +14,8 @@ use crate::{pinterest, x, youtube};
 
 pub enum Evt {
     Probed { token: u64, res: Result<Probe, String> },
+    /// Running commentary from a long probe ("Board: 200 of 356 pins").
+    ProbeStatus { token: u64, text: String },
     Named { id: u64, name: String },
     Progress { id: u64, done: u64, total: u64 },
     Phase { id: u64, text: String },
@@ -19,6 +23,29 @@ pub enum Evt {
     Error { id: u64, msg: String },
     ToolReady { tool: crate::tools::Tool, res: Result<PathBuf, String> },
     Notice(String),
+}
+
+/// Lets a long probe (a whole board) report progress and be stopped.
+pub struct Ctx<'a> {
+    pub progress: &'a dyn Fn(String),
+    pub cancel: &'a AtomicBool,
+    /// Search without the usual time budget (slow on big accounts).
+    pub deep: bool,
+}
+
+#[cfg(test)]
+impl Ctx<'static> {
+    /// No progress, never cancelled.
+    pub fn quiet() -> Self {
+        static NEVER: AtomicBool = AtomicBool::new(false);
+        Ctx { progress: &|_| {}, cancel: &NEVER, deep: false }
+    }
+}
+
+impl Ctx<'_> {
+    pub fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
 }
 
 pub struct Job {
@@ -36,7 +63,7 @@ pub fn agent() -> ureq::Agent {
 }
 
 /// Works out what `url` holds without downloading the body.
-pub fn probe(agent: &ureq::Agent, tools: &Tools, url: &str) -> Result<Probe, String> {
+pub fn probe(agent: &ureq::Agent, tools: &Tools, url: &str, ctx: &Ctx) -> Result<Probe, String> {
     if let Some(id) = x::tweet_id(url) {
         return x::resolve(agent, &id);
     }
@@ -44,7 +71,7 @@ pub fn probe(agent: &ureq::Agent, tools: &Tools, url: &str) -> Result<Probe, Str
         return youtube::probe(tools, &id);
     }
     if pinterest::is_pinterest(url) {
-        return pinterest::resolve(agent, tools, url);
+        return pinterest::resolve(agent, tools, url, ctx);
     }
     if url.split(['?', '#']).next().is_some_and(|p| p.ends_with(".m3u8")) {
         let host = url.split('/').nth(2).unwrap_or("link").to_string();
@@ -58,7 +85,9 @@ pub fn probe(agent: &ureq::Agent, tools: &Tools, url: &str) -> Result<Probe, Str
                 variants: vec![Variant { url: url.to_string(), label: "STREAM".into(), height: None }],
                 fetch: Fetch::Hls,
                 default_on: true,
+                subdir: String::new(),
             }],
+            note: String::new(),
         });
     }
     let resp = agent.get(url).call().map_err(|e| e.to_string())?;
@@ -85,8 +114,42 @@ pub fn probe(agent: &ureq::Agent, tools: &Tools, url: &str) -> Result<Probe, Str
             variants: vec![Variant { url: url.to_string(), label: "ORIGINAL".into(), height: None }],
             fetch: Fetch::Http,
             default_on: true,
+            subdir: String::new(),
         }],
+        note: String::new(),
     })
+}
+
+/// Runs `jobs` on `workers` threads; each result goes to `done`.
+/// Returns once every job has finished.
+pub fn run_all(
+    tools: &Tools,
+    folder: &Path,
+    jobs: Vec<Job>,
+    workers: usize,
+    report: &(dyn Fn(Evt) + Sync),
+    done: &(dyn Fn(&Job, Result<PathBuf, String>) + Sync),
+) {
+    let queue = Arc::new(Mutex::new(std::collections::VecDeque::from(jobs)));
+    std::thread::scope(|s| {
+        for _ in 0..workers.max(1) {
+            let queue = queue.clone();
+            s.spawn(move || {
+                let agent = agent();
+                loop {
+                    let Some(job) = queue.lock().unwrap().pop_front() else { break };
+                    let res = run(&agent, tools, folder, &job, report);
+                    done(&job, res);
+                }
+            });
+        }
+    });
+}
+
+/// A size that isn't on the server (Pinterest answers 403 for missing
+/// originals, others 404).
+fn missing(err: &str) -> bool {
+    err.contains("status code 404") || err.contains("status code 403")
 }
 
 /// Temp files of one job start with this, so a failure can sweep them all
@@ -106,12 +169,22 @@ pub fn run(
 ) -> Result<PathBuf, String> {
     let m = &job.media;
     let ffmpeg = tools.ffmpeg.as_deref();
+    let dir = folder.join(&m.subdir);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let folder = dir.as_path();
     let fmt = if m.kind == Kind::File { Fmt::Original } else { job.fmt };
     if ffmpeg.is_none() && media::needs_ffmpeg(m, fmt) {
         return Err(format!("{} needs ffmpeg: press GET FFMPEG", fmt.label()));
     }
     let out_ext = if fmt == Fmt::Original { m.src_ext.as_str() } else { fmt.ext() };
-    let dest = unique_path(folder.join(format!("{}.{out_ext}", m.stem)));
+    let planned = folder.join(format!("{}.{out_ext}", m.stem));
+    // Boards and profiles download into their own folder; running one again
+    // only fetches what isn't there yet.
+    if !m.subdir.is_empty() && planned.is_file() {
+        report(Evt::Named { id: job.id, name: format!("{} (already there)", m.stem) });
+        return Ok(planned);
+    }
+    let dest = unique_path(planned);
     let shown = dest.file_name().map_or(String::new(), |s| s.to_string_lossy().into_owned());
     report(Evt::Named { id: job.id, name: shown });
 
@@ -122,11 +195,12 @@ pub fn run(
                 let src = folder.join(format!("{}{}", temp_prefix(job.id), m.src_ext));
                 let part = src.with_extension(format!("{}.part", m.src_ext));
                 // Size lists can name sizes that don't exist (old YouTube
-                // videos have no maxres thumbnail): step down on 404.
+                // videos have no maxres thumbnail, some pins no original):
+                // step down to the next size.
                 let mut tries = m.variants[first..].iter().peekable();
                 while let Some(v) = tries.next() {
                     match fetch(agent, &v.url, &part, job.id, report) {
-                        Err(e) if e.contains("status code 404") && tries.peek().is_some() => continue,
+                        Err(e) if missing(&e) && tries.peek().is_some() => continue,
                         r => r?,
                     }
                     break;

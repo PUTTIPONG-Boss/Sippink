@@ -133,6 +133,8 @@ pub struct Media {
     pub fetch: Fetch,
     /// Ticked in the chooser to begin with (extras like thumbnails aren't).
     pub default_on: bool,
+    /// Folder under the download folder, e.g. a board name ("" = none).
+    pub subdir: String,
 }
 
 #[derive(Clone, Debug)]
@@ -140,18 +142,18 @@ pub struct Probe {
     /// Shown above the chooser, e.g. "@gdldev on X".
     pub title: String,
     pub items: Vec<Media>,
+    /// Caveat shown under the title, e.g. "Pinterest shows 200 of 356 pins".
+    pub note: String,
 }
 
 impl Probe {
-    /// Kinds present, in first-seen order.
+    /// Kinds present, always in the same order so the chooser's rows and
+    /// buttons don't move around between links.
     pub fn kinds(&self) -> Vec<Kind> {
-        let mut v = Vec::new();
-        for m in &self.items {
-            if !v.contains(&m.kind) {
-                v.push(m.kind);
-            }
-        }
-        v
+        [Kind::Video, Kind::Gif, Kind::Image, Kind::File]
+            .into_iter()
+            .filter(|k| self.items.iter().any(|m| m.kind == *k))
+            .collect()
     }
 }
 
@@ -259,6 +261,7 @@ mod tests {
             variants: vec![],
             fetch: Fetch::Http,
             default_on: true,
+            subdir: String::new(),
         }
     }
 

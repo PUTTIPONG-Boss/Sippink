@@ -41,10 +41,31 @@ rank, so picking the 2nd-biggest video also takes the 2nd-biggest thumbnail.
   pictures and clips, each its own item) and pins that embed a Vimeo /
   YouTube video (fetched through yt-dlp, the pin image offered as a cover).
   Works with `pinterest.<any country>/pin/...` and `pin.it` short links. Uses
-  the site's own public pin resource, so no login. Boards and profiles are
-  not supported yet. `/pin/e1_...` links copied from logged-out search are
-  temporary session tokens the site itself can't open; use the pin's Share
-  link instead.
+  the site's own public resources, so no login. `/pin/e1_...` links copied
+  from logged-out search are temporary session tokens the site itself can't
+  open; use the pin's Share link instead.
+- **Pinterest boards, sections and profiles**:
+
+  | Link | Downloads into |
+  |---|---|
+  | `/<user>/<board>/` | `<board>/` |
+  | `/<user>/<board>/<section>/` | `<board>/<section>/` |
+  | `/<user>/` (or `_saved`) | `<user>/<board>/` for every board |
+  | `/<user>/_created/` | `<user>/created/` |
+
+  Scanning shows live progress and can be cancelled. Big sets get per-type
+  toggles (`[x] 62 IMAGE  [x] 1 GIF ...`) instead of one button per pin.
+  Downloads run 4 at a time, and running the same board again only fetches
+  pins that aren't in its folder yet.
+
+  Logged out, Pinterest's board feed stops early (anywhere from 24 to 200
+  pins). Sippink then looks through the owner's pin list, which pages all
+  the way and says which board each pin is on, newest first. That finds
+  nearly everything for most boards, but an old board on a huge account
+  (one test account had 173,556 pins) would take an hour, so the search
+  stops after the owner's newest 5,000 pins (about two minutes) and says
+  how many it found; **SEARCH ALL** (or `--deep`) keeps going. Board
+  sections can't be completed this way, so a capped section says so.
 - **HLS streams** (`.m3u8`): best rendition plus its audio, copied into MP4
   by ffmpeg without re-encoding.
 - **Any direct file link**: type detected from `Content-Type` / extension.
@@ -76,7 +97,7 @@ Same pipeline as the window, handy for scripts and testing (use a debug
 build, release builds have no console):
 
 ```
-sippink --get <url> [--fmt mp4|mp3|m4a|gif|webm|jpg|png|webp] [--quality best|medium|small|1080p|...] [--out dir] [--probe] [--all]
+sippink --get <url> [--fmt mp4|mp3|m4a|gif|webm|jpg|png|webp] [--quality best|medium|small|1080p|...] [--out dir] [--probe] [--all] [--limit n] [--deep]
 sippink --install yt-dlp|ffmpeg|deno
 sippink <url> [--out dir]        # open the window with this link
 ```

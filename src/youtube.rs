@@ -83,6 +83,7 @@ pub fn probe_url(tools: &Tools, url: &str) -> Result<Probe, String> {
             .collect(),
         fetch: Fetch::YtDlp,
         default_on: true,
+        subdir: String::new(),
     };
     if video.variants.is_empty() {
         if v["formats"].as_array().map_or(true, |f| f.is_empty()) {
@@ -98,6 +99,7 @@ pub fn probe_url(tools: &Tools, url: &str) -> Result<Probe, String> {
     Ok(Probe {
         title: format!("{title} | {channel} | {}:{:02}", secs / 60, secs % 60),
         items,
+        note: String::new(),
     })
 }
 
@@ -150,6 +152,7 @@ fn thumbnail(v: &Value, stem: &str) -> Option<Media> {
         variants,
         fetch: Fetch::Http,
         default_on: false,
+        subdir: String::new(),
     })
 }
 

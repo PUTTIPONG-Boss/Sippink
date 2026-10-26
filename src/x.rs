@@ -79,7 +79,7 @@ pub fn resolve(agent: &ureq::Agent, id: &str) -> Result<Probe, String> {
             m
         })
         .collect();
-    Ok(Probe { title: format!("@{user} on X"), items })
+    Ok(Probe { title: format!("@{user} on X"), items, note: String::new() })
 }
 
 /// Every media entity of one tweet object (stems are filled in by the caller).
@@ -131,6 +131,7 @@ fn to_media(m: &Value) -> Option<Media> {
         variants,
         fetch: Fetch::Http,
         default_on: true,
+        subdir: String::new(),
     };
     match m["type"].as_str()? {
         "photo" => {

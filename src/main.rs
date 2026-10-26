@@ -3,7 +3,9 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use egui::RichText;
@@ -25,7 +27,7 @@ use media::{Fmt, Kind, Probe, Quality};
 use theme::{AMBER, DIM, FG, RED};
 use tools::{Tool, Tools};
 
-const COMPACT: [f32; 2] = [560.0, 470.0];
+const COMPACT: [f32; 2] = [560.0, 510.0];
 const FULL: [f32; 2] = [820.0, 600.0];
 
 fn dbg_log(msg: &str) {
@@ -68,10 +70,15 @@ struct DlRow {
     started: Instant,
 }
 
+/// Downloads running at once.
+const WORKERS: usize = 4;
+/// Above this many items the chooser toggles whole kinds, not single items.
+const MANY: usize = 12;
+
 /// Where the link box is in its probe -> choose -> download cycle.
 enum Stage {
     Idle,
-    Probing { token: u64, url: String },
+    Probing { token: u64, url: String, status: String, cancel: Arc<AtomicBool> },
     Ready { probe: Probe, pick: Vec<bool> },
     Failed(String),
 }
@@ -237,17 +244,25 @@ impl App {
 
     /// Step 1: find out what the link is.
     fn start_probe(&mut self) {
+        self.probe_with(false);
+    }
+
+    /// `deep`: search big Pinterest accounts without the time budget.
+    fn probe_with(&mut self, deep: bool) {
         let url = self.url.trim().to_string();
         if !is_link(&url) {
             return;
         }
         let token = self.next_token;
         self.next_token += 1;
-        self.stage = Stage::Probing { token, url: url.clone() };
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.stage = Stage::Probing { token, url: url.clone(), status: String::new(), cancel: cancel.clone() };
         let report = self.reporter();
         let tools = self.tools.clone();
         std::thread::spawn(move || {
-            let res = job::probe(&job::agent(), &tools, &url);
+            let progress = |text| report(Evt::ProbeStatus { token, text });
+            let ctx = job::Ctx { progress: &progress, cancel: &cancel, deep };
+            let res = job::probe(&job::agent(), &tools, &url, &ctx);
             report(Evt::Probed { token, res });
         });
     }
@@ -278,14 +293,13 @@ impl App {
         let report = self.reporter();
         let (folder, tools) = (self.folder.clone(), self.tools.clone());
         std::thread::spawn(move || {
-            let agent = job::agent();
-            for j in jobs {
-                let evt = match job::run(&agent, &tools, &folder, &j, &report) {
+            let done = |j: &Job, res: Result<PathBuf, String>| {
+                report(match res {
                     Ok(path) => Evt::Done { id: j.id, path },
                     Err(msg) => Evt::Error { id: j.id, msg },
-                };
-                report(evt);
-            }
+                })
+            };
+            job::run_all(&tools, &folder, jobs, WORKERS, &report, &done);
         });
         self.url.clear();
         self.focus_input = true;
@@ -312,6 +326,13 @@ impl App {
                     };
                     if self.auto && matches!(self.stage, Stage::Ready { .. }) {
                         self.start_jobs();
+                    }
+                }
+                Evt::ProbeStatus { token, text } => {
+                    if let Stage::Probing { token: t, status, .. } = &mut self.stage {
+                        if *t == token {
+                            *status = text;
+                        }
                     }
                 }
                 Evt::Named { id, name } => {
@@ -393,17 +414,25 @@ impl App {
     fn chooser(&mut self, ui: &mut egui::Ui) {
         let mut go = false;
         let mut cancel = false;
+        let mut deeper = false;
         match &mut self.stage {
             Stage::Idle => {
                 theme::pane(ui, "", |ui| {
                     ui.label(RichText::new("waiting for a link_").color(DIM));
                 });
             }
-            Stage::Probing { url, .. } => {
+            Stage::Probing { url, status, cancel: stop, .. } => {
                 let dots = ".".repeat(1 + (ui.input(|i| i.time) * 3.0) as usize % 3);
                 theme::pane(ui, "SCAN", |ui| {
                     ui.label(format!("looking inside{dots}"));
+                    if !status.is_empty() {
+                        ui.add(egui::Label::new(RichText::new(status.as_str()).color(AMBER)).truncate(true));
+                    }
                     ui.add(egui::Label::new(RichText::new(url.as_str()).color(DIM)).truncate(true));
+                    if ui.button("CANCEL").clicked() {
+                        stop.store(true, Ordering::Relaxed);
+                        cancel = true;
+                    }
                 });
             }
             Stage::Failed(msg) => {
@@ -427,6 +456,14 @@ impl App {
                 theme::pane(ui, &title, |ui| {
                     ui.add(egui::Label::new(RichText::new(&probe.title).color(DIM)).truncate(true))
                         .on_hover_text(&probe.title);
+                    if !probe.note.is_empty() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new(format!("! {}", probe.note)).color(AMBER));
+                            if probe.note.contains("SEARCH ALL") && ui.small_button("SEARCH ALL").clicked() {
+                                deeper = true;
+                            }
+                        });
+                    }
                     egui::Grid::new("fmt").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                         for k in &kinds {
                             let sample = probe.items.iter().find(|m| m.kind == *k).unwrap();
@@ -464,7 +501,28 @@ impl App {
                             ui.end_row();
                         }
                     });
-                    if probe.items.len() > 1 {
+                    if probe.items.len() > MANY {
+                        // Hundreds of pins: toggle a whole kind at a time.
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("TAKE").color(AMBER));
+                            for k in &kinds {
+                                let idx: Vec<usize> = (0..probe.items.len()).filter(|i| probe.items[*i].kind == *k).collect();
+                                let on = idx.iter().filter(|i| pick[**i]).count();
+                                let mark = match on {
+                                    0 => " ",
+                                    n if n == idx.len() => "x",
+                                    _ => "~",
+                                };
+                                let txt = format!("[{mark}] {} {}", idx.len(), k.label());
+                                if ui.selectable_label(on > 0, txt).clicked() {
+                                    let to = on == 0;
+                                    for i in idx {
+                                        pick[i] = to;
+                                    }
+                                }
+                            }
+                        });
+                    } else if probe.items.len() > 1 {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(RichText::new("ITEMS").color(AMBER));
                             for (i, (m, p)) in probe.items.iter().zip(pick.iter_mut()).enumerate() {
@@ -491,6 +549,8 @@ impl App {
         }
         if go {
             self.start_jobs();
+        } else if deeper {
+            self.probe_with(true);
         } else if cancel {
             self.stage = Stage::Idle;
         }
@@ -498,7 +558,14 @@ impl App {
 
     fn download_list(&mut self, ui: &mut egui::Ui, compact: bool) {
         let mut clear = false;
-        theme::pane(ui, "QUEUE", |ui| {
+        let ok = self.downloads.iter().filter(|r| r.stat == Stat::Done).count();
+        let bad = self.downloads.iter().filter(|r| r.stat == Stat::Error).count();
+        let title = match self.downloads.len() {
+            0 => "QUEUE".to_string(),
+            n if bad > 0 => format!("QUEUE {ok}/{n} done, {bad} failed"),
+            n => format!("QUEUE {ok}/{n} done"),
+        };
+        theme::pane(ui, &title, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
                 let take = if compact { 3 } else { usize::MAX };
                 for r in self.downloads.iter().rev().take(take) {
@@ -705,6 +772,8 @@ fn cli(args: &[String]) -> i32 {
     let mut out = dirs::download_dir().unwrap_or_else(|| PathBuf::from("."));
     let mut only_probe = false;
     let mut all = false;
+    let mut deep = false;
+    let mut limit = usize::MAX;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -723,6 +792,8 @@ fn cli(args: &[String]) -> i32 {
             "--out" => out = it.next().map(PathBuf::from).unwrap_or(out),
             "--probe" => only_probe = true,
             "--all" => all = true,
+            "--deep" => deep = true,
+            "--limit" => limit = it.next().and_then(|n| n.parse().ok()).unwrap_or(usize::MAX),
             "--install" => {
                 let name = it.next().map(String::as_str).unwrap_or("");
                 let Some(t) = Tool::ALL.into_iter().find(|t| t.name() == name) else {
@@ -745,12 +816,17 @@ fn cli(args: &[String]) -> i32 {
     }
     let Some(url) = url else {
         eprintln!("usage: sippink --install yt-dlp|ffmpeg|deno");
-        eprintln!("       sippink --get <url> [--fmt mp4|mp3|m4a|gif|webm|jpg|png|webp] [--quality best|medium|small|1080p|...] [--out dir] [--probe] [--all]");
+        eprintln!("       sippink --get <url> [--fmt mp4|mp3|m4a|gif|webm|jpg|png|webp] [--quality best|medium|small|1080p|...] [--out dir] [--probe] [--all] [--limit n] [--deep]");
         return 2;
     };
     let agent = job::agent();
     let tools = Tools::detect();
-    let probe = match job::probe(&agent, &tools, &url) {
+    let progress = |text: String| eprint!("\r  {text:<70}");
+    let never = AtomicBool::new(false);
+    let ctx = job::Ctx { progress: &progress, cancel: &never, deep };
+    let probe = job::probe(&agent, &tools, &url, &ctx);
+    eprint!("\r{:<74}\r", "");
+    let probe = match probe {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: {e}");
@@ -758,7 +834,10 @@ fn cli(args: &[String]) -> i32 {
         }
     };
     println!("{}", probe.title);
-    for (i, m) in probe.items.iter().enumerate() {
+    if !probe.note.is_empty() {
+        println!("  ! {}", probe.note);
+    }
+    for (i, m) in probe.items.iter().enumerate().take(if only_probe { usize::MAX } else { 10 }) {
         let sizes: Vec<&str> = m.variants.iter().map(|v| v.label.as_str()).collect();
         let fmts: Vec<&str> = m.kind.formats().iter().map(|f| f.label()).collect();
         println!("  {}. {:<5} {}  sizes={sizes:?}  formats={fmts:?}", i + 1, m.kind.label(), m.stem);
@@ -786,31 +865,40 @@ fn cli(args: &[String]) -> i32 {
         }
     };
     let _ = std::fs::create_dir_all(&out);
-    let mut failed = 0;
-    for (i, m) in probe.items.into_iter().enumerate().filter(|(_, m)| all || m.default_on) {
-        let f = media::usable_fmt(&m, fmt, tools.ffmpeg.is_some());
-        let j = Job { id: i as u64 + 1, media: m, fmt: f, quality };
-        let last = std::cell::RefCell::new(String::new());
-        let report = |e: Evt| {
-            if let Evt::Phase { text, .. } = e {
-                if !text.is_empty() && *last.borrow() != text {
-                    println!("     {text}...");
-                    *last.borrow_mut() = text;
-                }
-            }
-        };
-        match job::run(&agent, &tools, &out, &j, &report) {
-            Ok(p) => {
-                let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-                println!("  ok  {}  ({})", p.display(), human(size));
-            }
-            Err(e) => {
-                failed += 1;
-                println!("  ERR item {}: {e}", i + 1);
+    if probe.items.len() > 10 {
+        println!("  ... {} items in all", probe.items.len());
+    }
+    let jobs: Vec<Job> = probe
+        .items
+        .into_iter()
+        .enumerate()
+        .filter(|(_, m)| all || m.default_on)
+        .take(limit)
+        .map(|(i, m)| {
+            let fmt = media::usable_fmt(&m, fmt, tools.ffmpeg.is_some());
+            Job { id: i as u64 + 1, media: m, fmt, quality }
+        })
+        .collect();
+    let failed = std::sync::atomic::AtomicUsize::new(0);
+    let report = |e: Evt| {
+        if let Evt::Phase { id, text } = e {
+            if !text.is_empty() {
+                println!("     #{id} {text}...");
             }
         }
-    }
-    i32::from(failed > 0)
+    };
+    let done = |j: &Job, res: Result<PathBuf, String>| match res {
+        Ok(p) => {
+            let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+            println!("  ok  {}  ({})", p.display(), human(size));
+        }
+        Err(e) => {
+            failed.fetch_add(1, Ordering::Relaxed);
+            println!("  ERR item {}: {e}", j.id);
+        }
+    };
+    job::run_all(&tools, &out, jobs, WORKERS, &report, &done);
+    i32::from(failed.load(Ordering::Relaxed) > 0)
 }
 
 fn main() -> eframe::Result<()> {
