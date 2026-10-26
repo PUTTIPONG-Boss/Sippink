@@ -36,9 +36,20 @@ rank, so picking the 2nd-biggest video also takes the 2nd-biggest thumbnail.
   MP3/M4A fetch only the audio, GIF only the video, WEBM grabs VP9/Opus
   directly so nothing is re-encoded, MP4 prefers H.264/AAC so it plays
   everywhere. Playlists and live streams are not supported yet.
+- **Pinterest**: photos, animated GIFs, video pins, idea/story pins
+  (image and video pages, including HLS-only clips), carousels (mixed
+  pictures and clips, each its own item) and pins that embed a Vimeo /
+  YouTube video (fetched through yt-dlp, the pin image offered as a cover).
+  Works with `pinterest.<any country>/pin/...` and `pin.it` short links. Uses
+  the site's own public pin resource, so no login. Boards and profiles are
+  not supported yet. `/pin/e1_...` links copied from logged-out search are
+  temporary session tokens the site itself can't open; use the pin's Share
+  link instead.
+- **HLS streams** (`.m3u8`): best rendition plus its audio, copied into MP4
+  by ffmpeg without re-encoding.
 - **Any direct file link**: type detected from `Content-Type` / extension.
 
-Planned: Reddit, Pinterest.
+Planned: Reddit.
 
 ## Helper tools
 

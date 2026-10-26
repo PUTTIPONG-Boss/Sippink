@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crate::files::{ext_for_mime, resolve_filename, sanitize, unique_path};
 use crate::media::{self, Fetch, Fmt, Kind, Media, Probe, Quality, Variant};
 use crate::tools::Tools;
-use crate::{x, youtube};
+use crate::{pinterest, x, youtube};
 
 pub enum Evt {
     Probed { token: u64, res: Result<Probe, String> },
@@ -42,6 +42,24 @@ pub fn probe(agent: &ureq::Agent, tools: &Tools, url: &str) -> Result<Probe, Str
     }
     if let Some(id) = youtube::video_id(url) {
         return youtube::probe(tools, &id);
+    }
+    if pinterest::is_pinterest(url) {
+        return pinterest::resolve(agent, tools, url);
+    }
+    if url.split(['?', '#']).next().is_some_and(|p| p.ends_with(".m3u8")) {
+        let host = url.split('/').nth(2).unwrap_or("link").to_string();
+        let stem = sanitize(url.split(['?', '#']).next().unwrap_or("").rsplit('/').next().unwrap_or("stream"));
+        return Ok(Probe {
+            title: format!("HLS stream from {host}"),
+            items: vec![Media {
+                kind: Kind::Video,
+                stem: stem.trim_end_matches(".m3u8").to_string(),
+                src_ext: "mp4".into(),
+                variants: vec![Variant { url: url.to_string(), label: "STREAM".into(), height: None }],
+                fetch: Fetch::Hls,
+                default_on: true,
+            }],
+        });
     }
     let resp = agent.get(url).call().map_err(|e| e.to_string())?;
     let name = resolve_filename(&resp, url);
@@ -117,6 +135,15 @@ pub fn run(
                 src
             }
             Fetch::YtDlp => youtube::download(tools, &m.variants[first], fmt, folder, job.id, report)?,
+            Fetch::Hls => {
+                let src = folder.join(format!("{}mp4", temp_prefix(job.id)));
+                report(Evt::Phase { id: job.id, text: "fetching stream".into() });
+                let ffmpeg = ffmpeg.ok_or("streams need ffmpeg: press GET FFMPEG")?;
+                let inputs = hls_inputs(agent, &m.variants[first].url)?;
+                fetch_hls(ffmpeg, &inputs, &src, job.id, report)?;
+                report(Evt::Phase { id: job.id, text: String::new() });
+                src
+            }
         };
         let src_ext = src.extension().map(|e| e.to_string_lossy().to_ascii_lowercase());
         if fmt == Fmt::Original || src_ext.as_deref() == Some(out_ext) {
@@ -170,4 +197,166 @@ pub fn fetch(
     }
     report(Evt::Progress { id, done, total });
     Ok(())
+}
+
+/// What to hand ffmpeg for an HLS link: the best video rendition and its
+/// separate audio rendition, if any.
+///
+/// Renditions stored as one CMAF file addressed by byte ranges (Pinterest
+/// does this) are passed as that plain file: ffmpeg's HLS reader garbles
+/// them and stops after a couple of seconds.
+fn hls_inputs(agent: &ureq::Agent, master: &str) -> Result<Vec<String>, String> {
+    let get = |url: &str| -> Result<String, String> {
+        agent.get(url).call().map_err(|e| e.to_string())?.into_string().map_err(|e| e.to_string())
+    };
+    let text = get(master)?;
+    if !text.contains("#EXT-X-STREAM-INF") {
+        return Ok(vec![single_file(master, &text).unwrap_or_else(|| master.to_string())]);
+    }
+    // Highest-bandwidth variant: its URI is the line after the tag.
+    let mut best: Option<(u64, &str)> = None;
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        if let Some(attrs) = line.strip_prefix("#EXT-X-STREAM-INF:") {
+            let bw = attr(attrs, "BANDWIDTH").and_then(|b| b.parse().ok()).unwrap_or(0);
+            let uri = lines.by_ref().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('#'));
+            if let Some(uri) = uri.filter(|_| best.map_or(true, |(b, _)| bw > b)) {
+                best = Some((bw, uri));
+            }
+        }
+    }
+    let video = join_url(master, best.ok_or("empty HLS playlist")?.1);
+    let mut inputs = vec![video];
+    let audio = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("#EXT-X-MEDIA:"))
+        .filter(|a| attr(a, "TYPE") == Some("AUDIO"))
+        .find_map(|a| attr(a, "URI"));
+    if let Some(a) = audio {
+        inputs.push(join_url(master, a));
+    }
+    for input in inputs.iter_mut() {
+        if let Ok(t) = get(input) {
+            if let Some(file) = single_file(input, &t) {
+                *input = file;
+            }
+        }
+    }
+    Ok(inputs)
+}
+
+/// The file behind a media playlist whose init map and every segment are
+/// byte ranges of one URI.
+fn single_file(playlist_url: &str, text: &str) -> Option<String> {
+    let map_uri = text.lines().filter_map(|l| l.strip_prefix("#EXT-X-MAP:")).find_map(|a| attr(a, "URI"))?;
+    let mut segs = text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#'));
+    let all_same = segs.all(|s| s == map_uri);
+    (all_same && text.contains("#EXT-X-BYTERANGE")).then(|| join_url(playlist_url, map_uri))
+}
+
+/// `KEY=value` or `KEY="value"` from an HLS attribute list.
+fn attr<'a>(attrs: &'a str, key: &str) -> Option<&'a str> {
+    let mut rest = attrs;
+    while !rest.is_empty() {
+        let (k, after) = rest.split_once('=')?;
+        let (v, next) = match after.strip_prefix('"') {
+            Some(q) => {
+                let (v, n) = q.split_once('"')?;
+                (v, n.strip_prefix(',').unwrap_or(n))
+            }
+            None => after.split_once(',').unwrap_or((after, "")),
+        };
+        if k.trim() == key {
+            return Some(v);
+        }
+        rest = next;
+    }
+    None
+}
+
+fn join_url(base: &str, rel: &str) -> String {
+    if rel.starts_with("http://") || rel.starts_with("https://") {
+        return rel.to_string();
+    }
+    let base = base.split(['?', '#']).next().unwrap_or(base);
+    match base.rfind('/') {
+        Some(i) => format!("{}/{rel}", &base[..i]),
+        None => rel.to_string(),
+    }
+}
+
+/// Copies the inputs (video, then optional audio) into one MP4 without
+/// re-encoding. ffmpeg's `-progress` lines give the bytes written so far;
+/// the total is unknown.
+fn fetch_hls(ffmpeg: &Path, inputs: &[String], to: &Path, id: u64, report: &dyn Fn(Evt)) -> Result<(), String> {
+    use std::io::BufRead;
+    let mut cmd = crate::tools::hidden(ffmpeg);
+    cmd.args(["-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:1", "-y"]);
+    for i in inputs {
+        cmd.arg("-i").arg(i);
+    }
+    if inputs.len() > 1 {
+        cmd.args(["-map", "0:v:0", "-map", "1:a:0"]);
+    }
+    let mut child = cmd
+        .args(["-c", "copy", "-movflags", "+faststart"])
+        .arg(to)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("ffmpeg: {e}"))?;
+    let stderr = child.stderr.take().unwrap();
+    let errs = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = std::io::Read::read_to_string(&mut std::io::BufReader::new(stderr), &mut buf);
+        buf
+    });
+    for line in std::io::BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok) {
+        if let Some(n) = line.strip_prefix("total_size=").and_then(|n| n.trim().parse().ok()) {
+            report(Evt::Progress { id, done: n, total: 0 });
+        }
+    }
+    let status = child.wait().map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        let err = errs.join().unwrap_or_default();
+        Err(format!("ffmpeg: {}", err.lines().last().unwrap_or("stream failed").trim()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_hls_attributes() {
+        let a = r#"TYPE=AUDIO,GROUP-ID="audio1",NAME="1",URI="x_audio.m3u8",CHANNELS="2""#;
+        assert_eq!(attr(a, "TYPE"), Some("AUDIO"));
+        assert_eq!(attr(a, "URI"), Some("x_audio.m3u8"));
+        assert_eq!(attr("BANDWIDTH=405528,CODECS=\"a,b\",RESOLUTION=1x2", "RESOLUTION"), Some("1x2"));
+        assert_eq!(join_url("https://h/a/b/m.m3u8?t=1", "v.m3u8"), "https://h/a/b/v.m3u8");
+        assert_eq!(join_url("https://h/a/m.m3u8", "https://o/v.m3u8"), "https://o/v.m3u8");
+    }
+
+    #[test]
+    fn spots_single_file_cmaf() {
+        let cmaf = "#EXTM3U
+#EXT-X-MAP:URI=\"v.cmfv\",BYTERANGE=\"971@0\"
+#EXTINF:2.0
+#EXT-X-BYTERANGE:10@971
+v.cmfv
+#EXTINF:2.0
+#EXT-X-BYTERANGE:10@981
+v.cmfv
+";
+        assert_eq!(single_file("https://h/p/v.m3u8", cmaf).as_deref(), Some("https://h/p/v.cmfv"));
+        let segmented = "#EXTM3U
+#EXTINF:2.0
+seg1.ts
+#EXTINF:2.0
+seg2.ts
+";
+        assert_eq!(single_file("https://h/p/v.m3u8", segmented), None);
+    }
 }

@@ -117,6 +117,8 @@ pub struct Variant {
 pub enum Fetch {
     Http,
     YtDlp,
+    /// An HLS (.m3u8) stream, remuxed to MP4 by ffmpeg.
+    Hls,
 }
 
 #[derive(Clone, Debug)]
@@ -173,9 +175,11 @@ fn image_crate_can(src_ext: &str, fmt: Fmt) -> bool {
 }
 
 pub fn needs_ffmpeg(m: &Media, fmt: Fmt) -> bool {
-    if m.fetch == Fetch::YtDlp {
+    match m.fetch {
         // yt-dlp can hand over MP4 (single-file formats) and M4A audio as-is.
-        return !matches!(fmt, Fmt::Mp4 | Fmt::M4a);
+        Fetch::YtDlp => return !matches!(fmt, Fmt::Mp4 | Fmt::M4a),
+        Fetch::Hls => return true,
+        Fetch::Http => {}
     }
     let passthrough = fmt == Fmt::Original || fmt.ext() == m.src_ext;
     !passthrough && !image_crate_can(&m.src_ext, fmt)
@@ -291,6 +295,8 @@ mod tests {
         assert!(!needs_ffmpeg(&yt, Fmt::M4a));
         assert!(needs_ffmpeg(&yt, Fmt::Mp3));
         assert!(needs_ffmpeg(&yt, Fmt::Webm));
+        let hls = Media { fetch: Fetch::Hls, ..media(Kind::Video, "mp4") };
+        assert!(needs_ffmpeg(&hls, Fmt::Mp4));
     }
 
     #[test]

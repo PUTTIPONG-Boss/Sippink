@@ -13,6 +13,7 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 mod files;
 mod job;
 mod media;
+mod pinterest;
 mod theme;
 mod tools;
 mod x;
@@ -360,7 +361,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(">").color(AMBER));
                 let te = egui::TextEdit::singleline(&mut self.url)
-                    .hint_text("paste a YouTube / X link or any file link")
+                    .hint_text("paste a YouTube / X / Pinterest link or any file link")
                     .desired_width(ui.available_width() - 70.0);
                 let r = ui.add(te);
                 if self.focus_input {
@@ -765,14 +766,13 @@ fn cli(args: &[String]) -> i32 {
     if only_probe {
         return 0;
     }
-    // best / medium / small, or a size label of the first sized item (1080p, ORIG...)
+    // best / medium / small, or a size label of any item (1080p, ORIG...)
     let quality = match quality_arg.as_str() {
         "BEST" => Quality::BEST,
         "MEDIUM" => Quality(0.5),
         "SMALL" => Quality(1.0),
         label => {
-            let sized = probe.items.iter().find(|m| m.variants.len() > 1);
-            let found = sized.and_then(|m| {
+            let found = probe.items.iter().find_map(|m| {
                 let i = m.variants.iter().position(|v| v.label.eq_ignore_ascii_case(label))?;
                 Some(Quality::at(i, m.variants.len()))
             });

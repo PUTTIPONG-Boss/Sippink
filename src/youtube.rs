@@ -47,7 +47,13 @@ pub fn watch_url(id: &str) -> String {
 }
 
 pub fn probe(tools: &Tools, id: &str) -> Result<Probe, String> {
-    let url = watch_url(id);
+    probe_url(tools, &watch_url(id))
+}
+
+/// Any page yt-dlp understands (YouTube, and e.g. Vimeo players embedded
+/// in Pinterest pins).
+pub fn probe_url(tools: &Tools, url: &str) -> Result<Probe, String> {
+    let url = url.to_string();
     let out = tools.ytdlp()?.args(["-J", &url]).output().map_err(|e| format!("yt-dlp: {e}"))?;
     if !out.status.success() {
         return Err(ytdlp_error(&out.stderr));
@@ -56,8 +62,10 @@ pub fn probe(tools: &Tools, id: &str) -> Result<Probe, String> {
     if v["is_live"] == true {
         return Err("live streams aren't supported yet".into());
     }
+    let id = v["id"].as_str().unwrap_or("video");
     let title = v["title"].as_str().unwrap_or(id);
-    let channel = v["channel"].as_str().or(v["uploader"].as_str()).unwrap_or("YouTube");
+    let site = v["extractor_key"].as_str().unwrap_or("YouTube");
+    let channel = v["channel"].as_str().or(v["uploader"].as_str()).unwrap_or(site);
     let secs = v["duration"].as_u64().unwrap_or(0);
     let mut stem = sanitize(title);
     if stem.chars().count() > 100 {
@@ -65,7 +73,7 @@ pub fn probe(tools: &Tools, id: &str) -> Result<Probe, String> {
     }
     let stem = format!("{stem} [{id}]");
 
-    let video = Media {
+    let mut video = Media {
         kind: Kind::Video,
         stem: stem.clone(),
         src_ext: "mp4".into(),
@@ -77,7 +85,11 @@ pub fn probe(tools: &Tools, id: &str) -> Result<Probe, String> {
         default_on: true,
     };
     if video.variants.is_empty() {
-        return Err("no downloadable formats (try UPDATE YT-DLP)".into());
+        if v["formats"].as_array().map_or(true, |f| f.is_empty()) {
+            return Err("no downloadable formats (try UPDATE YT-DLP)".into());
+        }
+        // Site lists formats without sizes: let yt-dlp pick its best.
+        video.variants.push(Variant { url: url.clone(), label: "BEST".into(), height: None });
     }
     let mut items = vec![video];
     if let Some(thumb) = thumbnail(&v, &stem) {
