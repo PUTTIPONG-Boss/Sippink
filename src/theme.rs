@@ -11,6 +11,20 @@ pub const DIM: Color32 = Color32::from_rgb(60, 122, 70);
 pub const AMBER: Color32 = Color32::from_rgb(255, 204, 51);
 pub const RED: Color32 = Color32::from_rgb(255, 95, 86);
 
+/// A system font, memory-mapped for the life of the app.
+///
+/// Read into a Vec, egui copies each font it is given (msgothic.ttc is 9 MB,
+/// and the copies came to ~30 MB). A borrowed mapping is never copied, and
+/// mapped pages are shared with Windows' own font cache instead of counting
+/// as Sippink's memory; only the glyphs actually drawn get paged in.
+fn map_font(path: &std::path::Path) -> Option<&'static [u8]> {
+    let file = std::fs::File::open(path).ok()?;
+    // SAFETY: a read-only mapping of a system font, which isn't modified
+    // while Windows has it installed.
+    let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+    Some(&Box::leak(Box::new(map))[..])
+}
+
 /// Stroke of `w` pixels.
 pub fn px(w: f32, c: Color32) -> Stroke {
     Stroke::new(w, c)
@@ -28,8 +42,8 @@ pub fn apply(ctx: &egui::Context) {
     let windir = std::env::var_os("WINDIR").unwrap_or_else(|| r"C:\Windows".into());
     for (name, file) in system {
         let path = std::path::Path::new(&windir).join("Fonts").join(file);
-        if let Ok(bytes) = std::fs::read(path) {
-            fonts.font_data.insert(name.into(), FontData::from_owned(bytes));
+        if let Some(bytes) = map_font(&path) {
+            fonts.font_data.insert(name.into(), FontData::from_static(bytes));
         }
     }
     for fam in [FontFamily::Monospace, FontFamily::Proportional] {

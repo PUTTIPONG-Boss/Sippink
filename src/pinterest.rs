@@ -108,9 +108,14 @@ fn paginate(
     ctx: &Ctx,
     mut page: impl FnMut(Vec<Value>) -> bool,
 ) -> Result<(), String> {
-    loop {
+    for n in 0usize.. {
         if ctx.cancelled() {
             return Err("cancelled".into());
+        }
+        // Each page's JSON is a few MB while parsed; long scans would pile
+        // that up between the trims done when work ends.
+        if n > 0 && n % 4 == 0 {
+            crate::mem::trim();
         }
         let body = call(agent, resource, &options)?;
         let data = &body["resource_response"]["data"];
@@ -129,6 +134,7 @@ fn paginate(
         }
         options["bookmarks"] = next.clone();
     }
+    Ok(())
 }
 
 pub fn resolve(agent: &ureq::Agent, tools: &Tools, url: &str, ctx: &Ctx) -> Result<Probe, String> {
@@ -224,13 +230,39 @@ fn pin_items(pin: &Value, subdir: &str) -> Vec<Media> {
     items
 }
 
-/// Media of many pins, each pin once.
-fn gather(pins: &[Value], subdir: impl Fn(&Value) -> String) -> Vec<Media> {
-    let mut seen = std::collections::HashSet::new();
-    pins.iter()
-        .filter(|p| pin_key(p).is_some_and(|k| seen.insert(k)))
-        .flat_map(|p| pin_items(p, &subdir(p)))
-        .collect()
+/// Pins already turned into download items, one entry per pin, in feed
+/// order. Feeds are converted page by page so their (large) JSON is dropped
+/// right away: holding a 529-pin profile as JSON took ~80 MB.
+#[derive(Default)]
+struct Shelf {
+    keys: Vec<String>,
+    items: std::collections::HashMap<String, Vec<Media>>,
+}
+
+impl Shelf {
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    fn has(&self, pin: &Value) -> bool {
+        pin_key(pin).is_some_and(|k| self.items.contains_key(&k))
+    }
+
+    /// Adds `pin` unless it's here already; with `replace`, this copy wins.
+    fn put(&mut self, pin: &Value, subdir: &str, replace: bool) {
+        let Some(key) = pin_key(pin) else { return };
+        let fresh = !self.items.contains_key(&key);
+        if fresh {
+            self.keys.push(key.clone());
+        }
+        if fresh || replace {
+            self.items.insert(key, pin_items(pin, subdir));
+        }
+    }
+
+    fn into_items(mut self) -> Vec<Media> {
+        self.keys.iter().flat_map(|k| self.items.remove(k).unwrap_or_default()).collect()
+    }
 }
 
 fn folder_name(s: &str) -> String {
@@ -262,12 +294,15 @@ fn resolve_board(agent: &ureq::Agent, user: &str, slug: &str, ctx: &Ctx) -> Resu
     let expected = board["pin_count"].as_u64().unwrap_or(0) as usize;
     let born = board["created_at"].as_str().and_then(date_key);
 
-    let mut pins: Vec<Value> = Vec::new();
+    let dir = folder_name(&name);
+    let mut pins = Shelf::default();
     let feed = serde_json::json!({
         "board_id": board_id, "field_set_key": "react_grid_pin", "prepend": false, "bookmarks": null,
     });
     paginate(agent, "BoardFeed", feed, ctx, |page| {
-        pins.extend(page);
+        for p in &page {
+            pins.put(p, &dir, false);
+        }
         (ctx.progress)(format!("{name}: {} of {expected} pins", pins.len()));
         true
     })?;
@@ -283,7 +318,6 @@ fn resolve_board(agent: &ureq::Agent, user: &str, slug: &str, ctx: &Ctx) -> Resu
             .ok()
             .and_then(|u| u["resource_response"]["data"]["pin_count"].as_u64());
         let of_total = total.map_or(String::new(), |t| format!(" of {t}"));
-        let mut have: std::collections::HashSet<String> = pins.iter().filter_map(pin_key).collect();
         let mut scanned = 0;
         let mut out_of_budget = false;
         let all = serde_json::json!({
@@ -293,20 +327,12 @@ fn resolve_board(agent: &ureq::Agent, user: &str, slug: &str, ctx: &Ctx) -> Resu
         paginate(agent, "UserPins", all, ctx, |page| {
             scanned += page.len();
             let last_date = page.last().and_then(|p| p["created_at"].as_str()).and_then(date_key);
-            for p in page {
-                let on_board = p["board"]["id"].as_str() == Some(board_id.as_str());
-                if !on_board {
-                    continue;
-                }
-                match pin_key(&p) {
-                    // Seen in the board feed under an e1_ id: keep this
-                    // copy instead, its numeric id makes a better name.
-                    Some(k) if !have.insert(k.clone()) => {
-                        if let Some(old) = pins.iter_mut().find(|o| pin_key(o).as_ref() == Some(&k)) {
-                            *old = p;
-                        }
-                    }
-                    _ => pins.push(p),
+            for p in &page {
+                if p["board"]["id"].as_str() == Some(board_id.as_str()) {
+                    // Also replaces pins the board feed gave under an e1_
+                    // id: this copy's numeric id makes a better file name.
+                    let replace = pins.has(p);
+                    pins.put(p, &dir, replace);
                 }
             }
             (ctx.progress)(format!(
@@ -328,12 +354,12 @@ fn resolve_board(agent: &ureq::Agent, user: &str, slug: &str, ctx: &Ctx) -> Resu
             };
         }
     }
-    let dir = folder_name(&name);
-    let items = gather(&pins, |_| dir.clone());
+    let n = pins.len();
+    let items = pins.into_items();
     if items.is_empty() {
         return Err("no pins found on this board".into());
     }
-    Ok(Probe { title: format!("{name} | board by @{owner} | {}", summary(pins.len(), &items)), items, note })
+    Ok(Probe { title: format!("{name} | board by @{owner} | {}", summary(n, &items)), items, note })
 }
 
 /// "Sat, 11 Feb 2012 01:23:35 +0000" as a sortable number (UTC; Pinterest
@@ -357,9 +383,12 @@ fn resolve_section(agent: &ureq::Agent, user: &str, board: &str, section: &str, 
     let section_id = sec["id"].as_str().ok_or("section not found")?.to_string();
     let title = sec["title"].as_str().unwrap_or(section).to_string();
     let expected = sec["pin_count"].as_u64().unwrap_or(0) as usize;
-    let mut pins = Vec::new();
+    let dir = format!("{}/{}", folder_name(board), folder_name(&title));
+    let mut pins = Shelf::default();
     paginate(agent, "BoardSectionPins", serde_json::json!({ "section_id": section_id }), ctx, |page| {
-        pins.extend(page);
+        for p in &page {
+            pins.put(p, &dir, false);
+        }
         (ctx.progress)(format!("{title}: {} of {expected} pins", pins.len()));
         true
     })?;
@@ -368,12 +397,12 @@ fn resolve_section(agent: &ureq::Agent, user: &str, board: &str, section: &str, 
     } else {
         String::new()
     };
-    let dir = format!("{}/{}", folder_name(board), folder_name(&title));
-    let items = gather(&pins, |_| dir.clone());
+    let n = pins.len();
+    let items = pins.into_items();
     if items.is_empty() {
         return Err("no pins found in this section".into());
     }
-    Ok(Probe { title: format!("{title} | section of {board} | {}", summary(pins.len(), &items)), items, note })
+    Ok(Probe { title: format!("{title} | section of {board} | {}", summary(n, &items)), items, note })
 }
 
 fn resolve_profile(agent: &ureq::Agent, user: &str, created: bool, ctx: &Ctx) -> Result<Probe, String> {
@@ -388,28 +417,28 @@ fn resolve_profile(agent: &ureq::Agent, user: &str, created: bool, ctx: &Ctx) ->
             "pin_filter": null, "page_size": 100,
         }))
     };
-    let mut pins = Vec::new();
+    let root = folder_name(user);
+    let mut pins = Shelf::default();
     paginate(agent, resource, options, ctx, |page| {
-        pins.extend(page);
+        for p in &page {
+            // Saved pins land in one folder per board, created ones together.
+            let dir = if created {
+                format!("{root}/created")
+            } else {
+                format!("{root}/{}", folder_name(p["board"]["name"].as_str().unwrap_or("other")))
+            };
+            pins.put(p, &dir, false);
+        }
         (ctx.progress)(format!("@{user}: {} pins so far", pins.len()));
         true
     })?;
-    let root = folder_name(user);
-    // Saved pins land in one folder per board, created ones together.
-    let items = if created {
-        let dir = format!("{root}/created");
-        gather(&pins, |_| dir.clone())
-    } else {
-        gather(&pins, |p| {
-            let board = p["board"]["name"].as_str().unwrap_or("other");
-            format!("{root}/{}", folder_name(board))
-        })
-    };
+    let n = pins.len();
+    let items = pins.into_items();
     if items.is_empty() {
         return Err(format!("@{user} has no public pins"));
     }
     let what = if created { "created by" } else { "saved by" };
-    Ok(Probe { title: format!("pins {what} @{user} | {}", summary(pins.len(), &items)), items, note: String::new() })
+    Ok(Probe { title: format!("pins {what} @{user} | {}", summary(n, &items)), items, note: String::new() })
 }
 
 /// Media of a pin in display order (stems are filled in by the caller).

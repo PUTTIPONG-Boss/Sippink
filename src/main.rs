@@ -14,6 +14,7 @@ use tray_icon::Icon;
 mod files;
 mod job;
 mod media;
+mod mem;
 mod pinterest;
 mod theme;
 mod tools;
@@ -86,6 +87,7 @@ enum Stage {
 struct App {
     /// Set by the tray when it showed the window; sized on the next frame.
     tray_request: tray::Request,
+    frames: u64,
     ctx: egui::Context,
     mode: Mode,
     positioned: bool,
@@ -157,6 +159,7 @@ impl App {
 
         App {
             tray_request,
+            frames: 0,
             ctx: cc.egui_ctx.clone(),
             mode: Mode::Compact,
             positioned: false,
@@ -207,6 +210,12 @@ impl App {
         dbg_log("hide");
         self.ctx
             .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        mem::trim();
+    }
+
+    /// A scan or a download is running.
+    fn busy(&self) -> bool {
+        matches!(self.stage, Stage::Probing { .. }) || self.downloads.iter().any(|r| r.stat == Stat::Running)
     }
 
     fn reporter(&self) -> impl Fn(Evt) + Send + 'static {
@@ -285,6 +294,15 @@ impl App {
     }
 
     fn drain(&mut self) {
+        let was_busy = self.busy();
+        self.drain_events();
+        // Burst of work over: give its memory back.
+        if was_busy && !self.busy() {
+            mem::trim();
+        }
+    }
+
+    fn drain_events(&mut self) {
         while let Ok(e) = self.rx.try_recv() {
             match e {
                 Evt::Probed { token, res } => {
@@ -668,6 +686,12 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Start-up (GL context, font atlas) leaves garbage behind; let it go
+        // once the first frames are on screen.
+        self.frames += 1;
+        if self.frames == 30 {
+            mem::trim();
+        }
         // keep the loop alive to poll tray events even while hidden
         ctx.request_repaint_after(Duration::from_millis(150));
         self.drain();
