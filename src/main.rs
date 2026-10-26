@@ -9,8 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use egui::RichText;
-use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use tray_icon::Icon;
 
 mod files;
 mod job;
@@ -18,6 +17,7 @@ mod media;
 mod pinterest;
 mod theme;
 mod tools;
+mod tray;
 mod x;
 mod youtube;
 
@@ -84,13 +84,11 @@ enum Stage {
 }
 
 struct App {
-    _tray: TrayIcon,
-    menu_open: MenuId,
-    menu_quit: MenuId,
+    /// Set by the tray when it showed the window; sized on the next frame.
+    tray_request: tray::Request,
     ctx: egui::Context,
     mode: Mode,
     positioned: bool,
-    really_quit: bool,
     url: String,
     folder: PathBuf,
     focus_input: bool,
@@ -120,6 +118,15 @@ fn icon_rgba(size: u32) -> (Vec<u8>, u32, u32) {
     (img.into_raw(), w, h)
 }
 
+/// The main window's HWND, for showing it from the tray while eframe is idle.
+fn window_handle(cc: &eframe::CreationContext<'_>) -> isize {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match cc.window_handle().map(|h| h.as_raw()) {
+        Ok(RawWindowHandle::Win32(w)) => w.hwnd.get(),
+        _ => 0,
+    }
+}
+
 fn tray_icon() -> Icon {
     let (rgba, w, h) = icon_rgba(32);
     Icon::from_rgba(rgba, w, h).expect("icon")
@@ -133,17 +140,7 @@ fn is_link(s: &str) -> bool {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::apply(&cc.egui_ctx);
-        let menu = Menu::new();
-        let open = MenuItem::new("Open full window", true, None);
-        let quit = MenuItem::new("Quit", true, None);
-        menu.append(&open).unwrap();
-        menu.append(&quit).unwrap();
-        let tray = TrayIconBuilder::new()
-            .with_menu(Box::new(menu))
-            .with_tooltip("Sippink — sip a link. Double-click to paste one")
-            .with_icon(tray_icon())
-            .build()
-            .expect("tray");
+        let tray_request = tray::install(tray_icon(), cc.egui_ctx.clone(), window_handle(cc));
 
         let (tx, rx) = std::sync::mpsc::channel::<Evt>();
         // `sippink [url] [--out dir]`
@@ -158,26 +155,11 @@ impl App {
             .unwrap_or_else(|| PathBuf::from("."));
         let pending_url = args.into_iter().find(|a| is_link(a));
 
-        // Tray clicks only fill a background channel; they don't wake winit.
-        // While hidden in the tray the window gets no repaints, so update()
-        // would never run to drain those events. This ticker wakes the event
-        // loop via eframe's proxy so tray actions are always processed.
-        {
-            let ctx = cc.egui_ctx.clone();
-            std::thread::spawn(move || loop {
-                std::thread::sleep(Duration::from_millis(120));
-                ctx.request_repaint();
-            });
-        }
-
         App {
-            _tray: tray,
-            menu_open: open.id().clone(),
-            menu_quit: quit.id().clone(),
+            tray_request,
             ctx: cc.egui_ctx.clone(),
             mode: Mode::Compact,
             positioned: false,
-            really_quit: false,
             url: String::new(),
             folder,
             focus_input: true,
@@ -216,6 +198,7 @@ impl App {
     fn show_full(&mut self) {
         dbg_log("show_full");
         self.mode = Mode::Full;
+        self.positioned = false;
         self.focus_input = true;
         self.show(FULL);
     }
@@ -694,44 +677,35 @@ impl eframe::App for App {
             self.start_probe();
         }
 
-        while let Ok(ev) = MenuEvent::receiver().try_recv() {
-            dbg_log(&format!("menu_event id={:?}", ev.id));
-            if ev.id == self.menu_open {
-                self.show_full();
-            } else if ev.id == self.menu_quit {
-                dbg_log("quit requested");
-                self.really_quit = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-        }
-        while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
-            match ev {
-                TrayIconEvent::DoubleClick { .. } => {
-                    dbg_log("tray DoubleClick");
-                    self.show_compact();
-                }
-                TrayIconEvent::Click { button, .. } => {
-                    dbg_log(&format!("tray Click {:?}", button));
-                    if button == tray_icon::MouseButton::Left {
-                        self.show_compact();
-                    }
-                }
-                other => dbg_log(&format!("tray {:?}", std::mem::discriminant(&other))),
-            }
+        // The tray already showed the window; size it for what was asked.
+        let asked = self.tray_request.lock().unwrap().take();
+        match asked {
+            Some(tray::Show::Full) => self.show_full(),
+            Some(tray::Show::Compact) => self.show_compact(),
+            None => {}
         }
 
-        if ctx.input(|i| i.viewport().close_requested()) && !self.really_quit {
+        if ctx.input(|i| i.viewport().close_requested()) {
             dbg_log("close_requested -> cancel+hide");
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.hide();
         }
 
-        if self.mode == Mode::Compact && !self.positioned {
+        // Compact sits above the tray corner; full is centred so it never
+        // grows off-screen from the compact spot.
+        if !self.positioned {
             if let Some(m) = ctx.input(|i| i.viewport().monitor_size) {
-                let [w, h] = COMPACT;
-                let x = (m.x - w - 24.0).max(0.0);
-                let y = (m.y - h - 64.0).max(0.0);
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
+                let pos = match self.mode {
+                    Mode::Compact => {
+                        let [w, h] = COMPACT;
+                        egui::pos2((m.x - w - 24.0).max(0.0), (m.y - h - 64.0).max(0.0))
+                    }
+                    Mode::Full => {
+                        let [w, h] = FULL;
+                        egui::pos2(((m.x - w) / 2.0).max(0.0), ((m.y - h) / 2.0).max(0.0))
+                    }
+                };
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
                 self.positioned = true;
             }
         }

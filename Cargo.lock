@@ -3553,10 +3553,12 @@ dependencies = [
  "eframe",
  "egui",
  "image 0.25.10",
+ "raw-window-handle 0.6.2",
  "rfd",
  "serde_json",
  "tray-icon",
  "ureq",
+ "windows-sys 0.52.0",
  "winresource",
  "zip",
 ]
