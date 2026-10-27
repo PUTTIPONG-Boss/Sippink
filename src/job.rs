@@ -77,6 +77,9 @@ pub fn probe(agent: &ureq::Agent, tools: &Tools, url: &str, ctx: &Ctx) -> Result
     if pinterest::is_pinterest(url) {
         return pinterest::resolve(agent, tools, url, ctx);
     }
+    if crate::meta::is_meta(url) {
+        return youtube::probe_url(tools, url);
+    }
     if url.split(['?', '#']).next().is_some_and(|p| p.ends_with(".m3u8")) {
         let host = url.split('/').nth(2).unwrap_or("link").to_string();
         let stem = sanitize(url.split(['?', '#']).next().unwrap_or("").rsplit('/').next().unwrap_or("stream"));

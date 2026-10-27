@@ -16,6 +16,7 @@ mod job;
 mod keys;
 mod media;
 mod mem;
+mod meta;
 mod pinterest;
 mod theme;
 mod tools;

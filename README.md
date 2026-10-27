@@ -7,7 +7,7 @@
 <p align="center">
   <i>sip</i> + <i>link</i>: paste a link, get the media.<br>
   A small Windows tray app (Rust + egui) with a terminal look, for YouTube,
-  X / Twitter, Pinterest and plain file links.
+  X / Twitter, Pinterest, Facebook and plain file links.
 </p>
 
 <p align="center">
@@ -75,6 +75,11 @@ rank, so picking the 2nd-biggest video also takes the 2nd-biggest thumbnail.
   MP3/M4A fetch only the audio, GIF only the video, WEBM grabs VP9/Opus
   directly so nothing is re-encoded, MP4 prefers H.264/AAC so it plays
   everywhere. Playlists and live streams are not supported yet.
+- **Facebook** (via yt-dlp): public videos and reels (`/reel/`, `/watch`,
+  `/videos/`, `fb.watch`), with the same formats and sizes as YouTube.
+  Instagram links are recognised too, but Instagram now hides almost every
+  post from logged-out visitors, so they usually end with "only shows this
+  post to logged-in users". Photos and private posts are not supported.
 - **Pinterest**: photos, animated GIFs, video pins, idea/story pins
   (image and video pages, including HLS-only clips), carousels (mixed
   pictures and clips, each its own item) and pins that embed a Vimeo /

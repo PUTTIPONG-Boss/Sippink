@@ -63,10 +63,12 @@ pub fn probe_url(tools: &Tools, url: &str) -> Result<Probe, String> {
         return Err("live streams aren't supported yet".into());
     }
     let id = v["id"].as_str().unwrap_or("video");
-    let title = v["title"].as_str().unwrap_or(id);
+    let title = crate::meta::clean_title(v["title"].as_str().unwrap_or(id));
     let site = v["extractor_key"].as_str().unwrap_or("YouTube");
     let channel = v["channel"].as_str().or(v["uploader"].as_str()).unwrap_or(site);
-    let secs = v["duration"].as_u64().unwrap_or(0);
+    // Facebook titles already end with the page name.
+    let title = title.strip_suffix(&format!(" | {channel}")).unwrap_or(title);
+    let secs = v["duration"].as_f64().unwrap_or(0.0).round() as u64;
     let mut stem = sanitize(title);
     if stem.chars().count() > 100 {
         stem = stem.chars().take(100).collect::<String>().trim().to_string();
@@ -253,6 +255,10 @@ fn ytdlp_error(stderr: &[u8]) -> String {
         .to_string();
     if line.contains("Sign in to confirm") {
         format!("YouTube wants a login for this one ({line})")
+    } else if line.contains("--cookies") || line.contains("login") {
+        // yt-dlp's text ends with a long FAQ pointer; the first sentence is enough.
+        let site = line.split(']').next().unwrap_or("").trim_start_matches('[');
+        format!("{site} only shows this post to logged-in users")
     } else {
         line
     }
