@@ -258,7 +258,7 @@ fn ytdlp_error(stderr: &[u8]) -> String {
     } else if line.contains("--cookies") || line.contains("login") {
         // yt-dlp's text ends with a long FAQ pointer; the first sentence is enough.
         let site = line.split(']').next().unwrap_or("").trim_start_matches('[');
-        format!("{site} only shows this post to logged-in users")
+        format!("{site} only shows this post to logged-in users (USE COOKIES, from a browser where you're logged in)")
     } else {
         line
     }

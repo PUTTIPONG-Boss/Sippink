@@ -79,17 +79,54 @@ pub fn find(tool: Tool) -> Option<PathBuf> {
     dirs.into_iter().map(|d| d.join(tool.exe())).find(|p| p.is_file())
 }
 
+/// Where the user's own cookies.txt is kept once they hand one over. Off
+/// unless this file exists.
+pub fn cookies_path() -> PathBuf {
+    dirs::data_dir().unwrap_or_else(std::env::temp_dir).join("sippink").join("cookies.txt")
+}
+
+/// Copies a cookies.txt exported from the user's browser into
+/// [`cookies_path`], after checking it is one.
+pub fn set_cookies(src: &Path) -> Result<PathBuf, String> {
+    let text = std::fs::read_to_string(src).map_err(|e| format!("can't read {}: {e}", src.display()))?;
+    if !looks_like_cookies(&text) {
+        return Err("not a cookies.txt (Netscape format) file".into());
+    }
+    let dest = cookies_path();
+    if let Some(d) = dest.parent() {
+        std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&dest, text).map_err(|e| e.to_string())?;
+    Ok(dest)
+}
+
+pub fn forget_cookies() {
+    let _ = std::fs::remove_file(cookies_path());
+}
+
+/// Netscape cookie files: comment lines, and 7 tab-separated fields per cookie.
+fn looks_like_cookies(text: &str) -> bool {
+    let rows = text
+        .lines()
+        .filter(|l| !l.trim().is_empty() && (!l.starts_with('#') || l.starts_with("#HttpOnly_")))
+        .collect::<Vec<_>>();
+    !rows.is_empty() && rows.iter().all(|l| l.split('\t').count() == 7)
+}
+
 /// What a worker thread needs to know about the helpers.
 #[derive(Clone, Default)]
 pub struct Tools {
     pub ffmpeg: Option<PathBuf>,
     pub ytdlp: Option<PathBuf>,
     pub deno: Option<PathBuf>,
+    /// The user's cookies.txt, handed to yt-dlp for posts that need a login.
+    pub cookies: Option<PathBuf>,
 }
 
 impl Tools {
     pub fn detect() -> Self {
-        Tools { ffmpeg: find(Tool::Ffmpeg), ytdlp: find(Tool::YtDlp), deno: find(Tool::Deno) }
+        let cookies = Some(cookies_path()).filter(|p| p.is_file());
+        Tools { ffmpeg: find(Tool::Ffmpeg), ytdlp: find(Tool::YtDlp), deno: find(Tool::Deno), cookies }
     }
 
     pub fn get(&self, t: Tool) -> Option<&PathBuf> {
@@ -111,6 +148,10 @@ impl Tools {
         }
         if let Some(f) = &self.ffmpeg {
             cmd.arg("--ffmpeg-location").arg(f);
+        }
+        // yt-dlp only sends each cookie to its own site.
+        if let Some(c) = &self.cookies {
+            cmd.arg("--cookies").arg(c);
         }
         Ok(cmd)
     }
@@ -181,5 +222,19 @@ pub fn update_ytdlp(exe: &Path) -> Result<String, String> {
     } else {
         let err = String::from_utf8_lossy(&out.stderr);
         Err(err.lines().last().unwrap_or("update failed").trim().to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognises_cookie_files() {
+        let good = "# Netscape HTTP Cookie File\n\n.instagram.com\tTRUE\t/\tTRUE\t1893456000\tsessionid\tabc\n#HttpOnly_.facebook.com\tTRUE\t/\tTRUE\t0\txs\t1\n";
+        assert!(looks_like_cookies(good));
+        assert!(!looks_like_cookies("{\"cookies\": []}"));
+        assert!(!looks_like_cookies("name=value; other=1"));
+        assert!(!looks_like_cookies(""));
     }
 }

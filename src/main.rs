@@ -694,9 +694,40 @@ impl App {
                     });
                 }
             }
+            self.cookies_button(ui);
         });
         if !self.notice.is_empty() {
             ui.label(RichText::new(&self.notice).color(AMBER));
+        }
+    }
+
+    /// Off until the user picks a cookies.txt from their own browser; it is
+    /// kept in %APPDATA%\sippink and only ever passed to yt-dlp.
+    fn cookies_button(&mut self, ui: &mut egui::Ui) {
+        if self.tools.cookies.is_some() {
+            ui.label(RichText::new("cookies:on").color(DIM));
+            let r = ui.small_button("FORGET COOKIES");
+            if r.on_hover_text("delete Sippink's copy of your cookies.txt").clicked() {
+                tools::forget_cookies();
+                self.tools.cookies = None;
+                self.notice = "cookies deleted".into();
+            }
+            return;
+        }
+        let r = ui.small_button("USE COOKIES");
+        let hint = "for Instagram and posts that need a login: pick a cookies.txt exported \
+                    from your browser. It acts as your login, stays on this PC, and is \
+                    only sent to the sites it belongs to.";
+        if r.on_hover_text(hint).clicked() {
+            if let Some(f) = rfd::FileDialog::new().add_filter("cookies.txt", &["txt"]).pick_file() {
+                match tools::set_cookies(&f) {
+                    Ok(p) => {
+                        self.tools.cookies = Some(p);
+                        self.notice = "cookies on: delete the exported file, Sippink keeps its own copy".into();
+                    }
+                    Err(e) => self.notice = format!("cookies: {e}"),
+                }
+            }
         }
     }
 
@@ -881,6 +912,7 @@ fn cli(args: &[String]) -> i32 {
     let mut all = false;
     let mut deep = false;
     let mut limit = usize::MAX;
+    let mut cookies = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -898,6 +930,7 @@ fn cli(args: &[String]) -> i32 {
             "--quality" => quality_arg = it.next().map(|s| s.to_ascii_uppercase()).unwrap_or_default(),
             "--out" => out = it.next().map(PathBuf::from).unwrap_or(out),
             "--probe" => only_probe = true,
+            "--cookies" => cookies = it.next().map(PathBuf::from),
             "--all" => all = true,
             "--deep" => deep = true,
             "--limit" => limit = it.next().and_then(|n| n.parse().ok()).unwrap_or(usize::MAX),
@@ -950,12 +983,16 @@ fn cli(args: &[String]) -> i32 {
     }
     let Some(url) = url else {
         eprintln!("usage: sippink --install yt-dlp|ffmpeg|deno");
-        eprintln!("       sippink --get <url> [--fmt mp4|mp3|m4a|gif|webm|jpg|png|webp] [--quality best|medium|small|1080p|...] [--out dir] [--probe] [--all] [--limit n] [--deep]");
+        eprintln!("       sippink --get <url> [--fmt mp4|mp3|m4a|gif|webm|jpg|png|webp] [--quality best|medium|small|1080p|...] [--out dir] [--probe] [--all] [--limit n] [--deep] [--cookies cookies.txt]");
         eprintln!("       sippink --check-update | --update-to vX.Y.Z");
         return 2;
     };
     let agent = job::agent();
-    let tools = Tools::detect();
+    let mut tools = Tools::detect();
+    // A one-off file for this run; the saved copy is left alone.
+    if cookies.is_some() {
+        tools.cookies = cookies;
+    }
     let progress = |text: String| eprint!("\r  {text:<70}");
     let never = AtomicBool::new(false);
     let ctx = job::Ctx { progress: &progress, cancel: &never, deep };

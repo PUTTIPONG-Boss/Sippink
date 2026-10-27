@@ -7,7 +7,7 @@
 <p align="center">
   <i>sip</i> + <i>link</i>: paste a link, get the media.<br>
   A small Windows tray app (Rust + egui) with a terminal look, for YouTube,
-  X / Twitter, Pinterest, Facebook and plain file links.
+  X / Twitter, Pinterest, Facebook, Instagram and plain file links.
 </p>
 
 <p align="center">
@@ -77,9 +77,10 @@ rank, so picking the 2nd-biggest video also takes the 2nd-biggest thumbnail.
   everywhere. Playlists and live streams are not supported yet.
 - **Facebook** (via yt-dlp): public videos and reels (`/reel/`, `/watch`,
   `/videos/`, `fb.watch`), with the same formats and sizes as YouTube.
-  Instagram links are recognised too, but Instagram now hides almost every
-  post from logged-out visitors, so they usually end with "only shows this
-  post to logged-in users". Photos and private posts are not supported.
+- **Instagram** (via yt-dlp): reels and video posts. Instagram hides almost
+  every post from logged-out visitors, so this needs [your cookies](#cookies-optional).
+  Posts that need a login on Facebook work the same way. Photos are not
+  supported yet.
 - **Pinterest**: photos, animated GIFs, video pins, idea/story pins
   (image and video pages, including HLS-only clips), carousels (mixed
   pictures and clips, each its own item) and pins that embed a Vimeo /
@@ -135,13 +136,45 @@ Sippink also finds tools set in `SIPPINK_FFMPEG` / `SIPPINK_YTDLP` /
 Without ffmpeg, formats that need it are greyed out and X GIFs are saved as
 MP4 loops. JPG/PNG/WEBP conversions are built in.
 
+## Cookies (optional)
+
+Some posts only open for logged-in users (all of Instagram, private or
+age-gated Facebook videos). Sippink doesn't log in or get around login
+walls; instead you can lend it the login your browser already has:
+
+1. In a browser where you're logged in, export a `cookies.txt` (Netscape
+   format) with an extension such as *Get cookies.txt LOCALLY*.
+2. In Sippink press **USE COOKIES** and pick the file. Sippink keeps its own
+   copy in `%APPDATA%\sippink\cookies.txt`; delete the exported one.
+3. **FORGET COOKIES** deletes Sippink's copy again.
+
+Good to know:
+
+- **That file is your login.** Anyone who gets it can use your accounts
+  until you log out in the browser. Never send it to anyone or put it in a
+  shared folder; logging out in the browser makes it worthless.
+- It stays on your PC and is only handed to yt-dlp, which only sends each
+  cookie to the site it belongs to. yt-dlp refreshes it as sites rotate them.
+- Downloading a lot with a real account can get it rate-limited or flagged
+  by Instagram/Facebook. A spare account is safer.
+- Chrome and Edge encrypt their cookies, so exporting a file with an
+  extension is more reliable than reading the browser directly.
+
+## Fair use
+
+Sippink is for saving things you're allowed to keep: your own posts, media
+whose owner lets you, or copies for personal offline viewing where the law
+allows it. Most sites' terms forbid automated downloading, and keeping that
+in check is up to the person using the app. Respect creators: don't
+re-upload their work as yours.
+
 ## Command line
 
 Same pipeline as the window, handy for scripts and testing (use a debug
 build, release builds have no console):
 
 ```
-sippink --get <url> [--fmt mp4|mp3|m4a|gif|webm|jpg|png|webp] [--quality best|medium|small|1080p|...] [--out dir] [--probe] [--all] [--limit n] [--deep]
+sippink --get <url> [--fmt mp4|mp3|m4a|gif|webm|jpg|png|webp] [--quality best|medium|small|1080p|...] [--out dir] [--probe] [--all] [--limit n] [--deep] [--cookies cookies.txt]
 sippink --install yt-dlp|ffmpeg|deno
 sippink <url> [--out dir]        # open the window with this link
 ```
