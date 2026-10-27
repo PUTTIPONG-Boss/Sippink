@@ -20,6 +20,7 @@ mod pinterest;
 mod theme;
 mod tools;
 mod tray;
+mod update;
 mod x;
 mod youtube;
 
@@ -77,6 +78,16 @@ const WORKERS: usize = 4;
 /// Above this many items the chooser toggles whole kinds, not single items.
 const MANY: usize = 12;
 
+/// The CHECK UPDATE / UPDATE button's state.
+enum Upd {
+    Idle,
+    Checking,
+    Latest,
+    Available(String),
+    Installing,
+    Failed(String),
+}
+
 /// Where the link box is in its probe -> choose -> download cycle.
 enum Stage {
     Idle,
@@ -89,6 +100,7 @@ struct App {
     /// Set by the tray when it showed the window; sized on the next frame.
     tray_request: tray::Request,
     frames: u64,
+    update: Upd,
     ctx: egui::Context,
     mode: Mode,
     positioned: bool,
@@ -181,6 +193,7 @@ impl App {
         App {
             tray_request,
             frames: 0,
+            update: Upd::Idle,
             ctx: cc.egui_ctx.clone(),
             mode: Mode::Compact,
             positioned: false,
@@ -381,6 +394,15 @@ impl App {
                     self.tools = Tools::detect();
                 }
                 Evt::Notice(text) => self.notice = text,
+                Evt::UpdateChecked(res) => {
+                    self.update = match res {
+                        Ok(tag) if update::is_newer(&tag) => Upd::Available(tag),
+                        Ok(_) => Upd::Latest,
+                        Err(e) => Upd::Failed(e),
+                    }
+                }
+                Evt::Updated(Ok(exe)) => update::restart(&exe),
+                Evt::Updated(Err(e)) => self.update = Upd::Failed(e),
                 Evt::Error { id, msg } => {
                     if let Some(r) = self.row(id) {
                         r.stat = Stat::Error;
@@ -659,6 +681,7 @@ impl App {
                     self.install(t);
                 }
             }
+            self.update_button(ui);
             if let Some(exe) = self.tools.ytdlp.clone() {
                 let r = ui.small_button("UPDATE YT-DLP");
                 if r.on_hover_text("run this when YouTube downloads start failing").clicked() {
@@ -674,6 +697,76 @@ impl App {
         if !self.notice.is_empty() {
             ui.label(RichText::new(&self.notice).color(AMBER));
         }
+    }
+
+    fn update_button(&mut self, ui: &mut egui::Ui) {
+        let check = |ui: &mut egui::Ui, label: &str| ui.small_button(label).clicked();
+        match &self.update {
+            Upd::Idle => {
+                if check(ui, "CHECK UPDATE") {
+                    self.check_update();
+                }
+            }
+            Upd::Checking => {
+                ui.label(RichText::new("checking...").color(DIM));
+            }
+            Upd::Latest => {
+                ui.label(RichText::new(format!("v{} is the latest", update::CURRENT)).color(DIM));
+            }
+            Upd::Available(tag) => {
+                let tag = tag.clone();
+                let busy = self.busy();
+                let btn = egui::Button::new(RichText::new(format!("UPDATE TO {tag}")).color(AMBER));
+                let r = ui
+                    .add_enabled(!busy, btn)
+                    .on_hover_text(format!("download {tag} and restart"))
+                    .on_disabled_hover_text("wait for the downloads to finish");
+                if r.clicked() {
+                    self.start_update(tag);
+                }
+            }
+            Upd::Installing => {
+                ui.label(RichText::new("updating...").color(AMBER));
+            }
+            Upd::Failed(e) => {
+                ui.label(RichText::new(format!("update: {e}")).color(RED));
+                if check(ui, "RETRY") {
+                    self.check_update();
+                }
+            }
+        }
+    }
+
+    fn check_update(&mut self) {
+        self.update = Upd::Checking;
+        let report = self.reporter();
+        std::thread::spawn(move || report(Evt::UpdateChecked(update::latest_tag())));
+    }
+
+    /// Downloads release `tag` (shown in the queue), swaps it in and restarts.
+    fn start_update(&mut self, tag: String) {
+        self.update = Upd::Installing;
+        let id = self.next_id;
+        self.next_id += 1;
+        self.downloads.push(DlRow {
+            id,
+            name: format!("Sippink {tag}"),
+            done: 0,
+            total: 0,
+            stat: Stat::Running,
+            phase: String::new(),
+            err: String::new(),
+            path: None,
+            started: Instant::now(),
+        });
+        let report = self.reporter();
+        std::thread::spawn(move || {
+            let res = update::install(&job::agent(), &tag, id, &report);
+            if let Err(msg) = &res {
+                report(Evt::Error { id, msg: msg.clone() });
+            }
+            report(Evt::Updated(res));
+        });
     }
 
     /// Downloads a helper into Sippink's bin folder, shown as a queue row.
@@ -807,6 +900,33 @@ fn cli(args: &[String]) -> i32 {
             "--all" => all = true,
             "--deep" => deep = true,
             "--limit" => limit = it.next().and_then(|n| n.parse().ok()).unwrap_or(usize::MAX),
+            "--check-update" => {
+                return match update::latest_tag() {
+                    Ok(tag) => {
+                        let what = if update::is_newer(&tag) { "update available" } else { "up to date" };
+                        println!("this is v{}, latest is {tag}: {what}", update::CURRENT);
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        1
+                    }
+                };
+            }
+            // Also rolls back: any release tag works.
+            "--update-to" => {
+                let tag = it.next().cloned().unwrap_or_default();
+                return match update::install(&job::agent(), &tag, 0, &|_| {}) {
+                    Ok(p) => {
+                        println!("{} is now {tag}", p.display());
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        1
+                    }
+                };
+            }
             "--install" => {
                 let name = it.next().map(String::as_str).unwrap_or("");
                 let Some(t) = Tool::ALL.into_iter().find(|t| t.name() == name) else {
@@ -830,6 +950,7 @@ fn cli(args: &[String]) -> i32 {
     let Some(url) = url else {
         eprintln!("usage: sippink --install yt-dlp|ffmpeg|deno");
         eprintln!("       sippink --get <url> [--fmt mp4|mp3|m4a|gif|webm|jpg|png|webp] [--quality best|medium|small|1080p|...] [--out dir] [--probe] [--all] [--limit n] [--deep]");
+        eprintln!("       sippink --check-update | --update-to vX.Y.Z");
         return 2;
     };
     let agent = job::agent();
@@ -916,7 +1037,9 @@ fn cli(args: &[String]) -> i32 {
 
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "--get" || a == "--install") {
+    update::clean_up();
+    let cli_flags = ["--get", "--install", "--check-update", "--update-to"];
+    if args.iter().any(|a| cli_flags.contains(&a.as_str())) {
         std::process::exit(cli(&args));
     }
     let _ = std::fs::remove_file(std::env::temp_dir().join("sippink.log"));

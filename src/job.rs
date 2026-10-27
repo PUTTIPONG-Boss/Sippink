@@ -23,6 +23,10 @@ pub enum Evt {
     Error { id: u64, msg: String },
     ToolReady { tool: crate::tools::Tool, res: Result<PathBuf, String> },
     Notice(String),
+    /// Latest release tag, or why it couldn't be checked.
+    UpdateChecked(Result<String, String>),
+    /// The new exe is in place (start it), or the update failed.
+    Updated(Result<PathBuf, String>),
 }
 
 /// Lets a long probe (a whole board) report progress and be stopped.
