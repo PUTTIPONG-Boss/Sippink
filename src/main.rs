@@ -135,6 +135,26 @@ fn tray_icon() -> Icon {
     Icon::from_rgba(rgba, w, h).expect("icon")
 }
 
+/// Opens Explorer on the file's folder with the file selected.
+fn reveal(path: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Passed raw: `.arg()` would quote the whole "/select,..." when the
+        // path has a space, and Explorer then opens Documents instead.
+        let _ = std::process::Command::new("explorer").raw_arg(select_arg(path)).spawn();
+    }
+    #[cfg(not(windows))]
+    let _ = path;
+}
+
+/// `/select,"C:\dir\file name.mp4"`: only the path quoted, backslashes only
+/// (board downloads mix in `/`, which Explorer also rejects).
+fn select_arg(path: &std::path::Path) -> String {
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    format!("/select,\"{}\"", abs.to_string_lossy().replace('/', "\\"))
+}
+
 fn is_link(s: &str) -> bool {
     let s = s.trim();
     s.starts_with("http://") || s.starts_with("https://")
@@ -589,9 +609,7 @@ impl App {
                         };
                         if let Some(p) = &r.path {
                             if ui.small_button("OPEN").clicked() {
-                                let _ = std::process::Command::new("explorer")
-                                    .arg(format!("/select,{}", p.display()))
-                                    .spawn();
+                                reveal(p);
                             }
                         }
                         ui.add(egui::Label::new(RichText::new(detail).color(color)).truncate(true));
@@ -923,4 +941,13 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native("Sippink", options, Box::new(|cc| Box::new(App::new(cc))))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn select_arg_quotes_only_the_path() {
+        let p = std::path::Path::new(r"C:\Users\me\Downloads/Smart Casual/a b (1).jpg");
+        assert_eq!(super::select_arg(p), r#"/select,"C:\Users\me\Downloads\Smart Casual\a b (1).jpg""#);
+    }
 }
