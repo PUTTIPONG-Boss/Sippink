@@ -19,6 +19,25 @@
   <img src="docs/pinterest-board.png" width="420" alt="A whole Pinterest board: 1 video, 1 GIF and 62 images, toggled by type">
 </p>
 
+## Install
+
+Download and install the latest release for your user (no admin needed):
+
+```
+irm https://raw.githubusercontent.com/PUTTIPONG-Boss/Sippink/main/scripts/install.ps1 | iex
+```
+
+(in PowerShell; or download the `.exe` from Releases and run it as is)
+
+From a clone, `scripts\install.ps1` installs the latest release and
+`scripts\install.ps1 -Exe target
+elease\sippink.exe` installs your own build.
+
+It puts `Sippink.exe` in `%LOCALAPPDATA%\Programs\Sippink`, adds Start Menu
+and Desktop shortcuts (so Windows search finds it and you can pin it), and
+registers it in **Settings > Apps**, where **Uninstall** removes it again.
+Running the installer again updates it.
+
 ## What it does
 
 1. Paste a link and press **SIP** (or Enter).
