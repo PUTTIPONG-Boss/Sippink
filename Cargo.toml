@@ -7,6 +7,7 @@ description = "Paste a link, sip the media: YouTube / X / Pinterest downloader"
 repository = "https://github.com/PUTTIPONG-Boss/Sippink"
 
 [dependencies]
+arboard = "3"
 dirs = "5"
 eframe = "0.27"
 egui = "0.27"
@@ -17,6 +18,7 @@ rfd = "0.14"
 serde_json = "1"
 tray-icon = "0.26"
 ureq = "2.12"
+winit = "0.29"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
@@ -25,6 +27,7 @@ windows-sys = { version = "0.52", features = [
     "Win32_System_Memory",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
 

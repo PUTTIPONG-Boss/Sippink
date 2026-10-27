@@ -13,6 +13,7 @@ use tray_icon::Icon;
 
 mod files;
 mod job;
+mod keys;
 mod media;
 mod mem;
 mod pinterest;
@@ -685,6 +686,10 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        keys::apply(raw_input);
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Start-up (GL context, font atlas) leaves garbage behind; let it go
         // once the first frames are on screen.
@@ -908,6 +913,13 @@ fn main() -> eframe::Result<()> {
             .with_inner_size(COMPACT)
             .with_min_inner_size([420.0, 260.0])
             .with_resizable(true),
+        event_loop_builder: Some(Box::new(|builder| {
+            #[cfg(windows)]
+            {
+                use winit::platform::windows::EventLoopBuilderExtWindows;
+                builder.with_msg_hook(keys::hook);
+            }
+        })),
         ..Default::default()
     };
     eframe::run_native("Sippink", options, Box::new(|cc| Box::new(App::new(cc))))
